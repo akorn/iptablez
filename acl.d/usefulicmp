@@ -1,0 +1,17 @@
+echo-reply
+destination-unreachable
+network-unreachable
+host-unreachable
+protocol-unreachable
+port-unreachable
+fragmentation-needed
+network-unknown
+host-unknown
+network-prohibited
+host-prohibited
+communication-prohibited
+source-quench
+echo-request
+time-exceeded
+ttl-zero-during-transit
+ttl-zero-during-reassembly

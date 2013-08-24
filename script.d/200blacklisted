@@ -1,0 +1,5 @@
+iptables -N blacklisted
+
+iptables -A blacklisted ${=LOGLIMIT} -j LOG --log-prefix "FW: blacklisted DROP: "
+iptables -A blacklisted ${=ICMP_OUT_LIMIT} -j REJECT --reject-with admin-prohib
+iptables -A blacklisted -j DROP

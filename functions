@@ -1,0 +1,424 @@
+#
+# functions to ease the construction of iptables firewalls
+#
+# iptablez  Copyright (C) 2000-2013  Dr. András Korn
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see {http://www.gnu.org/licenses/}.
+
+# readacl()
+#
+# returns non-comment lines from the ACL file $1
+# supports includes; a line starting with ". " specifies a filename to
+# include, e.g.: ". $ACLDIR/other_file". Recursive including is supported;
+# be careful to avoid loops! Also, very deep include trees may exhaust file
+# descriptor limits.
+#
+function readacl() {
+	local i
+	local aclfile="$1"
+
+	[[ "$aclfile[1]" = / ]] || aclfile="$ACLDIR/$aclfile"
+
+	egrep -v '^[[:space:]#]*$|^#' "$aclfile" \
+		| sed 's/[[:space:]]*#.*//' \
+		| while read i; do
+			if [[ "$i" == "${i#. }" ]]; then
+				eval echo "$i"
+			else
+				readacl "$(eval echo "${i#. }")"
+			fi
+		done \
+		| egrep -v '^[[:space:]#]*$|^#' \
+		| sed 's/[[:space:]]*#.*//'
+}
+
+#
+# Stuff for the INPUT and OUTPUT chains (mostly anyway)
+#
+# buildchain(), buildtcpchain() and buildudpchain()
+#
+
+# buildchain()
+#
+# Usage: buildchain table PARENTCHAIN name parentselector childselector
+# ACLFILE action1 action2 message2 silentdropacl silentdropaction
+#
+# childselector can be empty, in which case it should prefix each line in
+# the ACLFILE.
+#
+# example: buildchain filter ssh INPUT "-p tcp --dport ssh" "-s" \
+#	/etc/firewall/acls/ssh_allow ACCEPT REJECT "FW: ssh REJECT: "
+#	/etc/firewall/acls/sshprobes 
+#
+# Will use LOGLIMIT, if set. If called with only one parameter, assumes it
+# is a config file and will source it. The config file should set the
+# variables you see below.
+#
+
+function buildchain() {
+	if [[ "$2" = "" ]]; then
+		. "$1"
+	else
+		local TABLE="$1"
+		local PARENT_CHAIN="$2"
+		local CHAIN="$3"
+		local PARENT_SELECTOR="$4"
+		local CHILD_SELECTOR="$5"
+#		local ACL=(${(P)${6}})
+		local ACLFILE="$6"
+		local PRIMARY_ACTION="$7"
+		local SECONDARY_ACTION="$8"
+		local SECMESSAGE="$9"
+		local SILENTACL="$10"
+		local SILENTDROP="${11:-DROP}"
+	fi
+	local i=0
+
+	readacl "$ACLFILE" | while read i; do
+		iptables -t $TABLE -A $CHAIN ${=CHILD_SELECTOR} ${=i} -j ${=PRIMARY_ACTION}
+	done
+	[[ -n "$SILENTACL" ]] && readacl "$SILENTACL" | while read i; do
+		iptables -t $TABLE -A $CHAIN ${=i} -j ${=SILENTDROP}
+	done
+	[[ -n "$SECMESSAGE" ]] && iptables -t $TABLE -A $CHAIN ${=LOGLIMIT} -j LOG --log-prefix "$SECMESSAGE"
+	iptables -t $TABLE -A $CHAIN -j ${=SECONDARY_ACTION}
+
+	iptables -t $TABLE -A $PARENT_CHAIN ${=PARENT_SELECTOR} -j $CHAIN	# enable it in the parent chain
+}
+
+# buildtcpchain()
+#
+# Usage: buildtcpchain { servicename|portnumber }
+#
+# buildtcpchain ssh is equivalent to (a shorthand for):
+#
+# buildchain filter INPUT ssh_input "-p tcp --dport ssh" "-s"
+#	$ACLDIR/ssh ACCEPT ${=REJECT} "FW: ssh DROP: "
+#
+
+function buildtcpchain() {
+	local PORT="$1"
+	local MYREJECT="${REJECT:-REJECT --reject-with tcp-reset}"
+	local MYACLDIR="${ACLDIR:-/etc/firewall/acl.d}"
+	local CHAIN="${PORT}_input"
+	local ACL="$MYACLDIR/${PORT}"
+	local FRIENDLYNAME="${PORT}"
+	local PARENT=INPUT
+	shift
+	while [[ ! "$1" = "" ]]; do
+		case "$1" in
+			"-c")
+				shift
+				local CHAIN="${1:-${PORT}_input}"
+				shift
+				;;
+			"-a")
+				shift
+				local ACL="${1:-$MYACLDIR/${PORT}}"
+				shift
+				;;
+			"-n")
+				shift
+				local FRIENDLYNAME="${1:-tcp/$PORT}"
+				shift
+				;;
+			"-p")
+				shift
+				local PARENT="$1"
+				shift
+				;;
+			*)
+				debug 1 buildtcpchain ignoring unknown parameter \""$1"\".
+				shift
+				;;
+		esac
+	done
+
+	buildchain filter "$PARENT" "$CHAIN" \
+		"-p tcp --dport $PORT" "-s" \
+		"$ACL" \
+		ACCEPT "$MYREJECT" "FW: $FRIENDLYNAME DROP: "
+}
+
+# buildudpchain()
+#
+# Usage: buildudpchain { servicename|portnumber }
+#
+# buildudpchain ntp is equivalent to (a shorthand for):
+#
+# buildchain filter INPUT ntp_input "-p udp --dport ntp" "-s"
+#	$ACLDIR/ntp ACCEPT ${=REJECT} "FW: ntp DROP: "
+#
+
+function buildudpchain() {
+	local PORT="$1"
+	local MYREJECT="${REJECT:-REJECT --reject-with tcp-reset}"
+	local MYACLDIR="${ACLDIR:-/etc/firewall/acl.d}"
+	local CHAIN="${PORT}_input"
+	local ACL="$MYACLDIR/${PORT}"
+	local FRIENDLYNAME="${PORT}"
+	local PARENT=INPUT
+	shift
+	while [[ ! "$1" = "" ]]; do
+		case "$1" in
+			"-c")
+				shift
+				local CHAIN="${1:-${PORT}_input}"
+				shift
+				;;
+			"-a")
+				shift
+				local ACL="${1:-$MYACLDIR/${PORT}}"
+				shift
+				;;
+			"-n")
+				shift
+				local FRIENDLYNAME="${1:-udp/$PORT}"
+				shift
+				;;
+			"-p")
+				shift
+				local PARENT="$1"
+				shift
+				;;
+			*)
+				debug 1 buildudpchain ignoring unknown parameter '"'"$1"'"'.
+				shift
+				;;
+		esac
+	done
+
+	buildchain filter "$PARENT" "$CHAIN" \
+		"-p udp --dport $PORT" "-s" \
+		"$ACL" \
+		ACCEPT "$MYREJECT" "FW: $FRIENDLYNAME DROP: "
+}
+
+#
+# Stuff for the FORWARD chain
+#
+# We need a function to police multipoint-multipoint traffic. pt-mpt, mpt-pt
+# and pt-pt are special cases (which could be handled specially, but
+# aren't). In fact, buildchain() can be used for these with an appropriately
+# chosen parentselector.
+#
+# build_multipoint_chain() is the most generic function.
+#
+# It will create two chains, like this:
+#
+# something_1:
+# -s sip1 -j something_2 # -s is childselector1
+# -s sip2 -j something_2
+# [...]
+# -j LOG --log-message "FW: something source DROP: " # message1
+# -j REJECT # REJECT is action2
+#
+# something_2:
+# -d dip1 -j ACCEPT # -d is childselector2
+# -d dip2 -j ACCEPT # ACCEPT is action1
+# [...]
+# -j LOG --log-message "FW: something destination DROP: " # message2
+# -j REJECT # REJECT is action2
+#
+# Usage: build_multipoint_chain table PARENTCHAIN name parentselector childselector1
+# ACLFILE1 childselector2 ACLFILE2 action1 action2 message1 message2
+#
+# This function performs an optimiziation based on the size of the ACLs
+# (it is faster to use the smaller one first). It is your responsibility to
+# not call it with chain names that already exist.
+
+function build_multipoint_chain() {
+	if [[ "$2" = "" ]]; then
+		. "$1"
+	else
+		local TABLE="$1"
+		local PARENT_CHAIN="$2"
+		local CHAIN_1="${3}_1"
+		local CHAIN_2="${3}_2"
+		local PARENT_SELECTOR="$4"
+		local ACLFILE_1="$6"
+		local ACLFILE_2="$8"
+
+		local ACL_1_SIZE="$(readacl "$ACLFILE_1" | wc -l)"
+		local ACL_2_SIZE="$(readacl "$ACLFILE_2" | wc -l)"
+
+		if [[ "$ACL_1_SIZE" -le "$ACL_2_SIZE" ]]; then
+			local CHILD_1_SELECTOR="$5"
+			local CHILD_2_SELECTOR="$7"
+			local MESSAGE_1="$11"
+			local MESSAGE_2="$12"
+		else
+			local CHILD_1_SELECTOR="$7"
+			local CHILD_2_SELECTOR="$5"
+			local MESSAGE_1="$12"
+			local MESSAGE_2="$11"
+			ACLFILE_1="$8"
+			ACLFILE_2="$6"
+		fi
+
+		local PRIMARY_ACTION="$9"
+		local SECONDARY_ACTION="$10"
+	fi
+	local i=0
+
+	iptables -t $TABLE -N $CHAIN_1
+	iptables -t $TABLE -N $CHAIN_2
+
+	# build first chain
+	readacl "$ACLFILE_1" | while read i; do
+		iptables -t $TABLE -A $CHAIN_1 ${=CHILD_1_SELECTOR} ${=i} -j $CHAIN_2
+	done
+	iptables -t $TABLE -A $CHAIN_1 ${=LOGLIMIT} -j LOG --log-prefix "$MESSAGE_1"
+	iptables -t $TABLE -A $CHAIN_1 -j ${=SECONDAY_ACTION}
+
+	# build second chain
+	readacl "$ACLFILE_2" | while read i; do
+		iptables -t $TABLE -A $CHAIN_2 ${=CHILD_2_SELECTOR} ${=i} -j ${=PRIMARY_ACTION}
+	done
+	iptables -t $TABLE -A $CHAIN_1 ${=LOGLIMIT} -j LOG --log-prefix "$MESSAGE_2"
+	iptables -t $TABLE -A $CHAIN_1 -j ${=SECONDAY_ACTION}
+
+	iptables -t $TABLE -A $PARENT_CHAIN ${=PARENT_SELECTOR} -j $CHAIN_1	# enable it in the parent chain
+}
+
+#
+# get_ports_of()
+#
+# Usage: get_ports_of {REGEX} {u|t}
+#
+# returns a comma-separated list of ports that a process matching REGEX
+# listens on (as displayed by netstat). u is for udp, t is for tcp.
+# REGEX is an extended regular expression.
+#
+function get_ports_of() {
+	echo \
+		$(netstat -n${2}lp \
+			| egrep -- "$1" \
+			| cut -d: -f2\
+			| sed 's/[[:space:]].*//' \
+		) \
+	| tr ' ' ','
+}
+
+# Get first IP of hostname
+function get_ip_of() {
+	tryto -t5 -k6 dnsip $1 | sed 's/[[:space:]].*//g' || {
+		echo "Failed to obtain IP of $1 via DNS." >&2
+	}
+}
+
+# Get main IP of interface
+function ip_of_if() {
+#	ifconfig $1 | grep 'inet addr:' | sed 's/.*inet addr://;s/ .*//'
+	if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -pa $1 | grep -v NON-IP
+	else
+		ifconfig $1 | sed -n '2s/ [^r]*..//gp' # Credit: ice and Pista
+	fi
+}
+
+# Get broadcast address of interface
+function get_if_broadcast() {
+	if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -pb $1 | grep -v NON-IP
+	else
+		ifconfig $1 | grep 'inet addr:' | sed 's/.*Bcast://;s/ .*//'
+	fi
+}
+
+# returns success if an interface exists, failure if it doesn't
+function if_exists() {
+	if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -e $1
+	else
+		grep -q "^[[:space:]]*$1: " /proc/net/dev
+	fi
+}
+
+# returns success if an interface is 'up', failure if not
+function if_up() {
+	if_exists $1 || return 1
+	if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -pf $1 | egrep -q '^On[[:space:]]+Up$'
+	else
+		ip link sh $1 | egrep -q "state UP "
+	fi
+}
+
+#
+# Don't actually call iptables; rather, build an iptables-restore compatible
+# text file.
+#
+function iptables() {
+	debug 5 Executing /sbin/iptables "$@"
+	if [[ "$1" == "-t" ]]; then
+		TABLE=$2
+		shift
+		shift
+	else
+		TABLE=filter
+	fi
+	if [[ "$1" == "-N" ]]; then
+		iptables-save -c -t $TABLE | grep "^:$2 " >>"$RESTOREDIR/${TABLE}.chains" || echo ":$2 - [0:0]" >>"$RESTOREDIR/${TABLE}.chains"
+		shift
+		shift
+	elif [[ "$1" == "-P" ]]; then
+		iptables-save -c -t $TABLE | grep "^:$2 $3 " >>"$RESTOREDIR/${TABLE}.policies" || echo ":$2 $3 [0:0]" >>"$RESTOREDIR/${TABLE}.policies"
+	else
+		echo "${(qqq)@}" | sed '
+				s/-p tcp/-p tcp -m tcp/
+				s/-p udp/-p udp -m udp/
+				s/NAT --to /NAT --to-destination /
+				s@/minute@/min@
+				s@/second@/sec@
+				s/"\([^ ]*\)"/\1/g
+			' >>"$RESTOREDIR/${TABLE}.rules"
+	fi
+}
+
+# Set up the work directory.
+function iptables_init() {
+	rm -rf "$RESTOREDIR"
+	mkdir -p "$RESTOREDIR"
+}
+
+# Load the rules we created.
+function iptables_commit() {
+	PWD="$(pwd)"
+	cd "$RESTOREDIR"
+	for table in filter nat mangle; do
+		touch ${table}.policies
+		if [[ (-e ${table}.chains) || (-e ${table}.policies) || (-e ${table}.rules) ]]; then
+			echo '*'"$table" >>commit
+			if [[ "$table" == "filter" ]]; then
+				builtin="INPUT OUTPUT FORWARD"
+			elif [[ "$table" == "nat" ]]; then
+				builtin="PREROUTING POSTROUTING OUTPUT"
+			elif [[ "$table" == "mangle" ]]; then
+				builtin="PREROUTING INPUT FORWARD OUTPUT POSTROUTING"
+			else
+				echo "Unknown table $table!"
+				return 1
+			fi
+			for chain in "${=builtin}"; do
+				grep ^:$chain ${table}.policies >>commit || iptables-save -c -t $table | grep "^:$chain " >>commit
+			done
+			[[ -e ${table}.chains ]] && cat ${table}.chains >>commit
+			[[ -e ${table}.rules ]] && cat ${table}.rules >>commit
+			echo COMMIT >>commit
+		fi
+	done
+	iptables-restore <commit
+	cd "$PWD"
+}

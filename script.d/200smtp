@@ -1,0 +1,17 @@
+iptables -N smtp_refused
+
+iptables -A smtp_refused ${=LOGLIMIT} -j LOG --log-prefix "FW: SMTP greylist: "
+iptables -A smtp_refused -p tcp -j REJECT --reject-with tcp-reset
+iptables -A smtp_refused -j DROP
+
+iptables -N smtp
+
+# If first connection arrived in last 180 seconds, REJECT
+iptables -A smtp -m recent --rcheck --name SMTP_bad --seconds ${SMTP_GREYLIST_TIME:-180} -j smtp_refused
+
+# If first connection arrived earlier than 180 seconds, ACCEPT
+iptables -A smtp -m recent --rcheck --name SMTP_bad -j ACCEPT
+
+# If neither, remember IP and REJECT
+iptables -A smtp -p tcp -m recent --set --name SMTP_bad -j REJECT --reject-with tcp-reset
+iptables -A smtp -j DROP

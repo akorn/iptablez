@@ -1,0 +1,93 @@
+#!/bin/zsh
+#
+# iptablez  Copyright (C) 2000-2013  Dr. András Korn
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see {http://www.gnu.org/licenses/}.
+#
+#
+# usage: iptablez [ debuglevel ]
+#
+# debuglevel is an integer; useful values range from 0 to 5. The default is
+# currently 1.
+
+BASEDIR=/etc/iptablez
+
+CONFFILES=($BASEDIR/iptablez.conf /etc/default/iptablez)
+
+for conf in $CONFFILES[@]; do
+	[[ -r "$conf" ]] && . $conf
+done
+
+CONFDIR=${CONFDIR:-$BASEDIR/conf.d}
+SCRIPTDIR=${SCRIPTDIR:-$BASEDIR/script.d}
+POSTDIR=${POSTDIR:-$BASEDIR/post.d}
+ACLDIR=${ACLDIR:-$BASEDIR/acl.d}
+RESTOREDIR=$BASEDIR/iptables-restore	# Will be removed and re-created; don't put anything in here!
+[[ "$1" = "" ]] || DEBUG=$1
+DEBUG=${DEBUG:-1}
+
+function debug() {
+	if [[ "$DEBUG" -ge "$1" ]]; then
+		shift
+		echo "$@"
+	fi
+}
+
+debug 2 Sourcing functions...
+. "$BASEDIR/functions"
+
+iptables_init
+
+# Can't assume no sourced script will read from stdin, so assmble list of
+# files to source before sourcing first one:
+for dir in "$CONFDIR" "$SCRIPTDIR"; do
+	for depth in {10..1}; do
+		find "$dir" -mindepth $depth -maxdepth $depth ! -type d \
+		| fgrep -v /.svn/ \
+		| sort \
+		| while read i; do
+			FILES=($FILES $i)
+		done
+	done
+done
+
+# Sourced files likely contain loops with "i" as the loop variable...
+for script_i in $FILES[@]; do
+	if [[ -r "$script_i" ]]; then
+		debug 2 Sourcing "$script_i"...
+		. "$script_i"
+	else
+		debug 1 WARNING: "$script_i" is unreadable.
+	fi
+done
+
+iptables_commit
+
+[[ -d "$POSTDIR" ]] && for depth in {10..1}; do
+	find "$POSTDIR" -mindepth $depth -maxdepth $depth ! -type d \
+	| fgrep -v /.svn/ \
+	| sort \
+	| while read i; do
+			POSTFILES=($POSTFILES $i)
+	done
+done
+
+for script_i in $POSTFILES[@]; do
+	if [[ -r "$script_i" ]]; then
+		debug 2 Sourcing "$script_i"...
+		. "$script_i"
+	else
+		debug 1 WARNING: "$script_i" is unreadable.
+	fi
+done

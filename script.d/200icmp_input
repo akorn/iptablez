@@ -1,0 +1,13 @@
+iptables -N icmp_input
+iptables -N icmp_input_limit
+
+iptables -A icmp_input_limit ${=ICMP_IN_LIMIT} -j ACCEPT
+iptables -A icmp_input_limit -j DROP
+
+readacl $ACLDIR/usefulicmp \
+	| while read i; do
+		iptables -A icmp_input -p icmp --icmp-type $i -j icmp_input_limit
+	done
+
+iptables -A icmp_input ${=LOGLIMIT} -j LOG --log-prefix "FW: offensive ICMP: "
+iptables -A icmp_input -j DROP

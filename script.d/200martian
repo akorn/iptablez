@@ -1,0 +1,5 @@
+iptables -N martian
+
+iptables -A martian ${=LOGLIMIT} -j LOG --log-prefix "FW: martian DROP: "
+iptables -A martian ${=ICMP_OUT_LIMIT} -j REJECT --reject-with admin-prohib
+iptables -A martian -j DROP
