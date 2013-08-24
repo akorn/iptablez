@@ -54,8 +54,8 @@ Symlink iptablez and functions into /etc/iptablez.
 
 Create scriptlets in conf.d, script.d and post.d (optional).
 
-Create ACL files in acl.d (one entry per line; empty lines ignored;
-# comments supported; recursive includes supported: ". file" includes
+Create ACL files in acl.d (one entry per line; empty lines ignored; comments
+starting with # supported; recursive includes supported: ". file" includes
 "file"; shell variables will be expanded, so you can do "-s $MYSERVER").
 
 Call /etc/iptablez/iptablez to build and load your ruleset.
