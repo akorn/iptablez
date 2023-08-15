@@ -1,0 +1,1 @@
+TCP_RST_OUT_LIMIT=(-m limit --limit 20/second)

@@ -1,0 +1,10 @@
+create -exist blacklisted		list:set							counters					comment skbinfo
+create -exist blacklisted_portscan	hash:ip		family inet netmask $antiportscan_netmask	counters forceadd timeout $antiportscan_timeout comment skbinfo
+create -exist blacklisted_ssh		hash:ip		family inet					counters forceadd timeout 3600			comment skbinfo
+create -exist blacklisted_static	hash:net	family inet					counters forceadd timeout 86400			comment skbinfo
+create -exist blacklisted_blocklist.de	hash:net	family inet					counters forceadd timeout 4000			comment skbinfo
+
+add -exist blacklisted blacklisted_portscan				comment "Addresses blacklisted due to perceived portscan activity"
+add -exist blacklisted blacklisted_ssh					comment "Addresses blacklisted due to many failed SSH logins"
+add -exist blacklisted blacklisted_static				comment "Addresses statically blacklisted due to various reasons, see comments"
+add -exist blacklisted blacklisted_blocklist.de				comment "Blacklisted addresses downloaded (presumably hourly) from blocklist.de"

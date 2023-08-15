@@ -1,0 +1,1 @@
+ICMP_IN_LIMIT=(-m limit --limit 250/second)

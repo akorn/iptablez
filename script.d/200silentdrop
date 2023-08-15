@@ -1,0 +1,3 @@
+iptables -N silentdrop
+iptables -A silentdrop $REJECT_BEFORE_DROP	# set in conf.d/reject to something like '(-j REJECT --reject-with admin-prohib $ICMP_OUT_LIMIT -m set --match-set private_nets src -m comment --comment "Internal clients get a helpful ICMP error, subject to rate limiting")'
+iptables -A silentdrop -j DROP			-m comment --comment "In other cases, we just drop the packets with no ICMP"

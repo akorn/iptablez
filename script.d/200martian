@@ -1,5 +1,16 @@
 iptables -N martian
+# The idea is to log and drop, but log with a descriptive message
 
-iptables -A martian ${=LOGLIMIT} -j LOG --log-prefix "FW: martian DROP: "
-iptables -A martian ${=ICMP_OUT_LIMIT} -j REJECT --reject-with admin-prohib
-iptables -A martian -j DROP
+[[ -z "$LOG" ]] && LOG=(-j LOG --log-prefix)
+[[ -z "$LOGLIMIT" ]] && LOGLIMIT=(-m limit --limit 5/minute)
+
+# example:
+# REJECT_BEFORE_DROP=(-j REJECT --reject-with admin-prohib $ICMP_OUT_LIMIT -m set --match-set private_nets src -m comment --comment "Internal clients get a helpful ICMP error, subject to rate limiting")
+
+if [[ ${$(typeset -p LOGLIMIT)[2]} = -a ]]; then
+	iptables -A martian $LOG "FW: martian DROP: "	$LOGLIMIT	-m comment --comment "Log martians with a meaningful message"
+else
+	iptables -A martian $LOG "FW: martian DROP: "	${=LOGLIMIT}	-m comment --comment "Log martians with a meaningful message"
+fi
+[[ -v REJECT_BEFORE_DROP ]] && iptables -A martian $REJECT_BEFORE_DROP
+iptables -A martian -j DROP						-m comment --comment "Drop martian packets"

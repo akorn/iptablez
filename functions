@@ -1,7 +1,7 @@
 #
 # functions to ease the construction of iptables firewalls
 #
-# iptablez  Copyright (C) 2000-2013  Dr. András Korn
+# iptablez  Copyright (C) 2000-2023  Dr. András Korn
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -22,29 +22,426 @@
 # supports includes; a line starting with ". " specifies a filename to
 # include, e.g.: ". $ACLDIR/other_file". Recursive including is supported;
 # be careful to avoid loops! Also, very deep include trees may exhaust file
-# descriptor limits.
+# descriptor limits. Shell variables in ACLs are expanded.
 #
 function readacl() {
-	local i
-	local aclfile="$1"
+	local i=""
 
-	[[ "$aclfile[1]" = / ]] || aclfile="$ACLDIR/$aclfile"
-
-	egrep -v '^[[:space:]#]*$|^#' "$aclfile" \
+	[[ -r "$1" ]] && egrep -v '^[[:space:]#]*$|^#' "$1" \
 		| sed 's/[[:space:]]*#.*//' \
-		| while read i; do
+		| while read -r i; do
 			if [[ "$i" == "${i#. }" ]]; then
-				eval echo "$i"
+				echo "${(e)i}"
 			else
-				readacl "$(eval echo "${i#. }")"
+				readacl "${(e)i#. }"
 			fi
 		done \
 		| egrep -v '^[[:space:]#]*$|^#' \
 		| sed 's/[[:space:]]*#.*//'
 }
 
+# TODO: wrap ipset(8) the same way we wrap iptables(8) and generate a file
+# we read at the end in one go; this would make it easy to warn if ipsets we
+# didn't create still exist, and/or if ipset elements we didn't create exist.
 #
-# Stuff for the INPUT and OUTPUT chains (mostly anyway)
+# reads 'ipset' commands from $IPSET_CONF_D and $IPSET_CONF
+# (/etc/firewall/ipset.d/* and etc/firewall/ipset.conf by default) and
+# executes them; supports shell variables and includes (since it uses
+# readacl()).  ipset comments should appear at the end of the ipset command
+# line.
+#
+# Tabs immediately following commas will be stripped (to allow the user to
+# make ipset.conf files more readable by tabulating them).
+#
+# Otherwise, ipset.conf is like 'ipset save' output.
+#
+# First, all files are scanned for 'create' commands and those are executed
+# before others, so you don't need to worry about what order your files will
+# be read in.
+function restore-ipsets() {
+	produce_ipset_lines | grep '^create ' | process_ipset_lines	# pass 1: process all 'create' lines
+	produce_ipset_lines | grep -v '^create ' | process_ipset_lines	# pass 2: process the rest
+}
+
+# helper function used by restore-ipsets(); reads ipset lines from stdin and executes them, logging failures to stderr
+function process_ipset_lines() {	
+	local -a args=() line=()
+	# the sed allows ipsets whose members are tuples to be tabulated for
+	# easier readability, but the TABs must immediately follow the
+	# commas and no other whitespace is allowed
+	sed 's/,\t*/,/g' \
+	| while read -rA line; do
+		while [[ $#line -gt 0 ]]; do
+			case $line[1] in
+				# when reading comment, remove quotes and parse the rest of the line into a single word:
+				comment)	shift line; args=($args comment "${line//\"/}"); line=();;
+				*)		args=($args $line[1]); shift line;;
+			esac
+		done
+		if ! ipset $args; then
+			echo "failing ipset command was: $args" >&2
+		fi
+		args=()
+	done 
+}
+
+# helper function used by restore-ipsets(); prints all ipset lines from ipset.d/* and ipset.conf. TODO: support an entire hierarchy of ipset.d/ directories (not hard, but I don't currently need it)
+function produce_ipset_lines() {
+	local i
+	for i in ${IPSET_CONF_D:-/etc/firewall/ipset.d}/*(N) ${IPSET_CONF:-/etc/firewall/ipset.conf}; do
+		readacl $i
+	done
+}
+
+#
+# get_ports_of()
+#
+# Usage: get_ports_of {REGEX} {u|t}
+#
+# returns a comma-separated list of ports that a process matching REGEX
+# listens on (as displayed by netstat). u is for udp, t is for tcp.
+# REGEX is an extended regular expression.
+#
+function get_ports_of() {
+	echo \
+		$(netstat -n${2}lp \
+			| grep -E -- "$1" \
+			| cut -d: -f2 \
+			| sed 's/[[:space:]].*//' \
+		) \
+	| tr ' ' ','
+}
+
+# Get first IP of hostname.
+# Positional arguments:
+#	* $1: name to look up
+#	* $2: fallback IP to return if lookup fails or times out (optional).
+#	* $3: name of variable to assign result to (optional). If specified, nothing is output on stdout.
+# Envvars used (set booleans to 1 for yes, 0 for no):
+#	* $DNS_CACHEDIR: the function caches DNS replies in files under DNSCACHEDIR; it sets mtime of cache files to NOW+TTL seconds. If the time is still in the future, the cache is fresh.
+#	* $DNS_NOCACHE: if set, the cache is not used (but will still be updated).
+#	* $DNS_FORCE_CACHE: if set, and there is a cached response, it'll be used without attempting a query even if the cache is stale.
+#	* $DNS_TIMEOUT: how many seconds, at most, to wait for a DNS reply.
+#	* $DNS_USE_STALE_CACHE: if set, and the DNS query times out, we'll return a cached result even if it's stale. A stale cache takes precedence over the fallback IP in $2.
+#	* $DNS_PURGE_STALE_CACHE: if set, a stale cache entry for $1 will be removed, except if other options (e.g. DNS_FORCE_CACHE) cause it to be used.
+#	* $DNS_MIN_TTL: if set, any TTL value lower than this will be treated as if it were this.
+#	* $DNS_MAX_TTL: if set, any TTL value higher than this will be treated as if it were this.
+#	* $DNS_FORCE_LOOKUP: if set, a lookup is performed even if the firewall configuration doesn't reference the name.
+#
+# Only performs a lookup if the firewall configuration actually references the name; this is where $3 is useful. If it's not referenced in any non-comment line in any file under $BASEDIR, then we avoid the lookup completely and just return an empty string.
+#
+# If no IP can be obtained, the function returns "N/A".
+#
+# Note on caching: using two gdbm files (one for results, one for expiry times of results) is tempting, but it wouldn't support multithreading. With the current approach, a background process can keep the cache fresh for future firewall reloads and concurrency is not a problem.
+DNS_CACHEDIR=/var/lib/firewall/dnscache
+DNS_NOCACHE=0
+DNS_FORCE_CACHE=0
+DNS_TIMEOUT=5
+DNS_USE_STALE_CACHE=0
+DNS_PURGE_STALE_CACHE=0
+DNS_MIN_TTL=10
+DNS_MAX_TTL=$[86400+3600]	# one day plus one hour
+DNS_FORCE_LOOKUP=0
+function get_ip_of() {
+	local dnscachedir=${DNS_CACHEDIR:-/var/lib/firewall/dnscache}
+	local cached_result
+	local name ttl type lookup_result crap
+	local lockfd
+	local query_timeout=${DNS_TIMEOUT:-5}
+	local varname=${3:-""}
+	if ! ((DNS_FORCE_LOOKUP)) && [[ -n "$varname" ]]; then					# Is this variable even used? If not, return early:
+		grep -qR '^[^#]*\$'"$varname"'\>' $BASEDIR || return 0
+	fi
+	# variable is used, or DNS_FORCE_LOOKUP is set; check cache
+	install -d -m 700 $dnscachedir
+	if ((DNS_PURGE_STALE_CACHE)) \
+		&& ! ((DNS_FORCE_CACHE)) \
+		&& ! ((DNS_USE_STALE_CACHE)) \
+		&& [[ -e $dnscachedir/$1 ]] \
+		&& [[ $(zstat -F %s +mtime $dnscachedir/$1) -lt $EPOCHSECONDS ]]; then	# are we supposed to purge stale cache entries? If yes and necessary, do so:
+			rm -f $dnscachedir/$1
+	fi
+	if ! ((DNS_NOCACHE)); then
+		# we are allowed to use the cache if it's fresh
+		if [[ -r $dnscachedir/$1 ]]; then
+			cached_result=$(<$dnscachedir/$1)
+			if [[ $(zstat -F %s +mtime $dnscachedir/$1) -ge $EPOCHSECONDS ]] || ((DNS_FORCE_CACHE)); then	# is cache fresh, or were we told to use it no matter what?
+				if [[ -n "$varname" ]]; then
+					typeset -g $varname="$cached_result"
+				else
+					echo -E "$cached_result"
+				fi
+				return 0
+			else
+				:	# cache was stale -- leave it alone, it may still be useful as a fallback later (we weren't asked to purge it via DNS_PURGE_STALE_CACHE)
+			fi
+		else
+			:	# no cache entry exists
+		fi
+	fi
+	# Actually perform the DNS lookup:
+	dig +noall +noclass +answer +timeout=$query_timeout -t a $1 | while read name ttl type lookup_result crap; do
+		[[ $type = A ]] && break	# could also be CNAME; if so, skip to next line
+		unset lookup_result		# if this line's type wasn't 'A', don't use the result because it's not an IP
+	done
+	# lookup_result now contains the contents of the first A record, if any (TODO: come up with a good mechanism to use all IPs if there are several)
+	if [[ -n "$lookup_result" ]]; then
+		: >>$dnscachedir/$1		# make sure the file exists before trying to lock it
+		if zsystem flock -t 0 -f lockfd $dnscachedir/$1; then	# obtain write lock; otherwise another thread may have obtained a different result with a different TTL, and there would be a race to set the mtime of the file, possibly resulting in a long TTL being applied to a result that had a short one
+			echo -E "$lookup_result" >$dnscachedir/$1
+			[[ -v DNS_MIN_TTL ]] && [[ $ttl -lt $DNS_MIN_TTL ]] && ttl=$DNS_MIN_TTL	# raise TTL to minimum if necessary
+			[[ -v DNS_MAX_TTL ]] && [[ $ttl -gt $DNS_MAX_TTL ]] && ttl=$DNS_MAX_TTL	# lower TTL to maximum if necessary
+			touch --date=@$[EPOCHSECONDS+ttl] $dnscachedir/$1
+			zsystem flock -u $lockfd
+		fi
+		if [[ -n "$varname" ]]; then
+			typeset -g $varname="$lookup_result"
+		else
+			echo -E "$lookup_result"
+		fi
+		return 0
+	else
+		if ((DNS_USE_STALE_CACHE)) && [[ -n "$cached_result" ]]; then	# if we're here, it means the cache, if any, was stale, but maybe we should return it anyway?
+			echo "Warning: Failed to obtain IP of $1 via DNS. Falling back to stale cached IP $cached_result." >&2
+			if [[ -n "$varname" ]]; then
+				typeset -g $varname="$cached_result"
+			else
+				echo -E "$cached_result"
+			fi
+			return 0
+		elif [[ -n "$2" ]]; then
+			echo "Failed to obtain IP of $1 via DNS or disk cache. Defaulting to $2." >&2
+			if [[ -n "$varname" ]]; then
+				typeset -g $varname="$2"
+			else
+				echo -E "$2"
+			fi
+			return 0
+		fi
+	fi
+	echo "Failed to obtain IP of $1 via DNS. No fallback IP provided; returning 'N/A' which will probably cause problems." >&2
+	if [[ -n "$varname" ]]; then
+		typeset -g $varname="N/A"
+	else
+		echo -E "N/A"
+	fi
+	return 1
+}
+
+# Returns first non-loopback IP address of lxc guest $1, or the first IP of guest interface $3 (if specified), defaulting to $2 (if specified); if no default is given and unable to obtain IP, return an error and the string "n/a"
+function get_lxc_guest_ip() {
+	local may_attach=${may_attach:-1}	# If may_attach=0, we won't try attaching to the container. This may be necessary if attaching to it might block.
+	[[ $# = 0 ]] && { echo n/a; return 1 }
+	local ip=""
+	if [[ $# -gt 0 ]]; then
+		local guest="$1"
+		if [[ $# -gt 1 ]]; then
+			local default="$2"
+			ip="$default"
+			if [[ $# -gt 2 ]]; then
+				local iface="$3"
+			fi
+		fi
+	fi
+	# currently we prefer existing runtime configuration to explicit written config -- is this always the best?
+	if ((may_attach)) && lxc-attach $guest true; then
+		if [[ -v iface ]]; then
+			ip=$(lxc-attach $guest -- ifdata -pa $iface 2>/dev/null)
+			if [[ $ip =~ ^[0-9.]+$ ]] then
+				echo "$ip"
+				return 0
+			else
+				ip=$(lxc-attach $guest -- ip -br addr sh dev $iface 2>/dev/null | sed 's/^[^[:space:]]\+[[:space:]]\+[^[:space:]]\+[[:space:]]\+//;s@/.*@@;s/\s.*//')
+				if [[ $ip =~ ^[0-9.]+$ ]] then
+					echo "$ip"
+					return 0
+				fi
+			fi
+		else
+			# guest is running, iface not specified; get first non-loopback IP if we can
+			ip=$(lxc-attach $guest -- ip -br addr sh 2>/dev/null | sed 's/^[^[:space:]]\+[[:space:]]\+[^[:space:]]\+[[:space:]]\+//;s@/[0-9]\+@@g;s/\s\+/\n/g' | grep '^[0-9.]\+$' | grep -v '^127\.' | head -n 1)
+			if [[ $ip =~ ^[0-9.]+$ ]] then
+				echo $ip
+				return 0
+			fi
+		fi
+	fi
+	# guest not running, or otherwise failed to get IP from running guest (if we had succeeded, we would have returned)
+	if [[ -v iface ]]; then
+		local ifnum=$(sed -n 's/^lxc\.net\.\([0-9]\+\)\.name[[:space:]]*=[[:space:]]*'$iface'/\1/p' /var/lib/lxc/$guest/config)
+		if [[ $ifnum =~ ^[0-9]+$ ]]; then
+			ip=$(sed -n 's/^lxc\.net\.'$ifnum'.ipv4\.address[[:space:]]*=[[:space:]]*\([0-9.]\+\)/\1/p' /var/lib/lxc/$guest/config)
+			if [[ $ip =~ ^[0-9.]+$ ]] then
+				echo $ip
+				return 0
+			fi
+		fi # here we could add an elif and try to parse it out of the /etc/network/interfaces file of the guest, but that really seems too much (it's not even necessarily a Debian-like guest)
+	else
+		# no iface specified; try to get *any* ipv4 address from lxc config
+		ip=$(sed -n 's/^lxc\.net\.[0-9]\+.ipv4\.address[[:space:]]*=[[:space:]]*\([0-9.]\+\)/\1/p' /var/lib/lxc/$guest/config | grep -v '^127\.' | head -n 1)
+		if [[ $ip =~ ^[0-9.]+$ ]] then
+			echo $ip
+			return 0
+		fi 
+	fi
+	# we failed to get any ip from the guest; return the default if specified, an error if not
+	if [[ -v default ]]; then
+		echo $default
+		return 0
+	else
+		echo n/a
+		return 1
+	fi
+}
+
+# Get main IP of interface; if none, print $2 instead
+function ip_of_if() {
+	local addr=$(if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -pa $1 | grep -v NON-IP
+	else
+		ifconfig $1 | sed -n '2s/ [^r]*..//gp'
+	fi)
+	echo ${addr:-$2}
+}
+
+# Get broadcast address of interface
+function get_if_broadcast() {
+	if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -pb $1 | grep -v NON-IP
+	else
+		ifconfig $1 | grep 'inet addr:' | sed 's/.*Bcast://;s/ .*//'
+	fi
+}
+
+# returns success if an interface exists, failure if it doesn't
+function if_exists() {
+	if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -e $1
+	else
+		grep -q "^[[:space:]]*$1: " /proc/net/dev
+	fi
+}
+
+# returns success if an interface is 'up', failure if not
+function if_up() {
+	if_exists $1 || return 1
+	if [[ -x /usr/bin/ifdata ]]; then
+		ifdata -pf $1 | egrep -q '^On[[:space:]]+Up$'
+	else
+		ip link sh $1 | egrep -q "state UP "
+	fi
+}
+
+#
+# Don't actually call iptables; rather, build an iptables-restore compatible
+# text file.
+#
+function iptables() {
+	debug 5 Executing /sbin/iptables "$@"
+	local w="" DNAT_DEST=""
+	if [[ "$1" == "-t" ]]; then
+		TABLE=$2
+		shift 2
+	else
+		TABLE=filter
+	fi
+	if [[ "$1" == "-N" ]]; then
+		iptables-save -c -t $TABLE | grep "^:$2 " >>"$RESTOREDIR/${TABLE}.chains" || echo ":$2 - [0:0]" >>"$RESTOREDIR/${TABLE}.chains"
+		shift 2
+	elif [[ "$1" == "-P" ]]; then
+		iptables-save -c -t $TABLE | grep "^:$2 $3 " >>"$RESTOREDIR/${TABLE}.policies" || echo ":$2 $3 [0:0]" >>"$RESTOREDIR/${TABLE}.policies"
+	else
+#		echo "${(qqq)@}" | sed '
+		while [[ $# -gt 0 ]]; do
+			case $1 in
+				*\ *)	echo -n " ${(qqq)1}"; shift;;						# quote words with embedded spaces
+#				-p)	echo -n " -p $2 -m $2"; shift 2;;					# convert "-p tcp" to "-p tcp -m tcp" -- no longer needed
+				-j)	if [[ $2 = DNAT ]]; then DNAT_DEST=$4; shift 4; else echo -n " $1"; shift; fi;;	# we will need to place "-j DNAT" after "-p", otherwise iptables-restore won't be able to load the file we generate
+				--nflog-prefix)	echo -n " $1"; shift; echo -n " ${(qqq)1% }"; shift;;		# NFLOG automatically inserts a space after the prefix, so we can cut off the one we put there for --log-prefix, which doesn't
+				--log-prefix)	echo -n " $1"
+						shift
+						if [[ $1 =~ \ $ ]]; then					# If the argument to --log-prefix doesn't end with a space, add one
+							echo -n " ${(qqq)1}"
+						else
+							w="$1 "
+							echo -n " ${(qqq)w}"
+						fi
+						shift;;
+				*)	w=${1//\/minute//min}; w=${w//\/second//sec}; echo -n " $w"; shift;;	# iptables-save only supports "min" and "sec", not "minute" and "second"
+			esac
+		done >>"$RESTOREDIR/${TABLE}.rules"
+		[[ -n $DNAT_DEST ]] && echo -n " -j DNAT --to-destination $DNAT_DEST" >>"$RESTOREDIR/${TABLE}.rules"
+		echo >>"$RESTOREDIR/${TABLE}.rules"
+#		echo "${(q)@}" | sed '
+#				s/-p tcp/-p tcp -m tcp/
+#				s/-p udp/-p udp -m udp/
+#				s/NAT --to /NAT --to-destination /
+#				s@/minute@/min@
+#				s@/second@/sec@
+#			' >>"$RESTOREDIR/${TABLE}.rules"
+##				s/"\([^ ]*\)"/\1/g
+##				s/--comment \([^"].*[^"]\) -j/--comment "\1" -j/
+	fi
+}
+
+# Sets $LOG array to a reasonable value that can be used in place of "-j LOG --log-prefix"
+function set_logtarget() {
+	[[ -v LOG ]] && return 0
+	LOG=(-j LOG --log-prefix)
+	if [[ -x /usr/sbin/virt-what ]]; then
+		if [[ $(virt-what) = lxc ]]; then
+			LOG=(-j NFLOG --nflog-prefix)
+		fi
+	fi
+}
+
+# Set up the work directory and set some defaults.
+function iptables_init() {
+	mkdir -p "$(readlink -f $RESTOREDIR)"
+	rm -f "$RESTOREDIR"/{filter,mangle,nat,raw}.{rules,chains,policies}(N) "$RESTOREDIR"/commit
+	set_logtarget
+}
+
+# Load the rules we created.
+function iptables_commit() {
+	pushd "$RESTOREDIR" || return 1
+	for table in filter nat mangle raw; do
+		touch ${table}.policies
+		if [[ (-e ${table}.chains) || (-e ${table}.policies) || (-e ${table}.rules) ]]; then
+			echo '*'"$table" >>commit
+			if [[ "$table" == "filter" ]]; then
+				builtin="INPUT OUTPUT FORWARD"
+			elif [[ "$table" == "nat" ]]; then
+				builtin="PREROUTING POSTROUTING OUTPUT"
+			elif [[ "$table" == "mangle" ]]; then
+				builtin="PREROUTING INPUT FORWARD OUTPUT POSTROUTING"
+			elif [[ "$table" == "raw" ]]; then
+				builtin="PREROUTING OUTPUT"
+			else
+				echo "Unknown table $table!"
+				return 1
+			fi
+			for chain in "${=builtin}"; do
+				grep ^:$chain ${table}.policies >>commit || iptables-save -c -t $table | grep "^:$chain " >>commit
+			done
+			[[ -e ${table}.chains ]] && cat ${table}.chains >>commit
+			[[ -e ${table}.rules ]] && cat ${table}.rules >>commit
+			echo COMMIT >>commit
+		fi
+	done
+	iptables-restore <commit
+	local r=$?
+	popd
+	return $r
+}
+
+# Does the interface exist and if yes, does it have an ipv4 IP?
+function has_ip() {
+	ip addr sh dev $1 2>/dev/null | grep -q "^[[:space:]]*inet "
+}
+
+#
+# Stuff for the INPUT and OUTPUT chains (mostly anyway) -- not as useful as originally envisioned (especially after ipsets became available); could likely be dropped
 #
 # buildchain(), buildtcpchain() and buildudpchain()
 #
@@ -62,8 +459,7 @@ function readacl() {
 #	/etc/firewall/acls/sshprobes 
 #
 # Will use LOGLIMIT, if set. If called with only one parameter, assumes it
-# is a config file and will source it. The config file should set the
-# variables you see below.
+# is a config file and will source it.
 #
 
 function buildchain() {
@@ -85,14 +481,16 @@ function buildchain() {
 	fi
 	local i=0
 
-	readacl "$ACLFILE" | while read i; do
-		iptables -t $TABLE -A $CHAIN ${=CHILD_SELECTOR} ${=i} -j ${=PRIMARY_ACTION}
-	done
-	[[ -n "$SILENTACL" ]] && readacl "$SILENTACL" | while read i; do
-		iptables -t $TABLE -A $CHAIN ${=i} -j ${=SILENTDROP}
-	done
-	[[ -n "$SECMESSAGE" ]] && iptables -t $TABLE -A $CHAIN ${=LOGLIMIT} -j LOG --log-prefix "$SECMESSAGE"
-	iptables -t $TABLE -A $CHAIN -j ${=SECONDARY_ACTION}
+	if iptables -t $TABLE -N $CHAIN; then	# We only build the chain if it didn't already exist.
+		readacl "$ACLFILE" | while read i; do
+			iptables -t $TABLE -A $CHAIN ${=CHILD_SELECTOR} ${=i} -j ${=PRIMARY_ACTION}
+		done
+		[[ -n "$SILENTACL" ]] && readacl "$SILENTACL" | while read i; do
+			iptables -t $TABLE -A $CHAIN ${=i} -j ${=SILENTDROP}
+		done
+		[[ -n "$SECMESSAGE" ]] && iptables -t $TABLE -A $CHAIN ${=LOGLIMIT} -j LOG --log-prefix "$SECMESSAGE"
+		iptables -t $TABLE -A $CHAIN -j ${=SECONDARY_ACTION}
+	fi
 
 	iptables -t $TABLE -A $PARENT_CHAIN ${=PARENT_SELECTOR} -j $CHAIN	# enable it in the parent chain
 }
@@ -109,7 +507,7 @@ function buildchain() {
 
 function buildtcpchain() {
 	local PORT="$1"
-	local MYREJECT="${REJECT:-REJECT --reject-with tcp-reset}"
+	local MYREJECT="${REJECT:-REJECT -p tcp --reject-with tcp-reset}"
 	local MYACLDIR="${ACLDIR:-/etc/firewall/acl.d}"
 	local CHAIN="${PORT}_input"
 	local ACL="$MYACLDIR/${PORT}"
@@ -292,133 +690,6 @@ function build_multipoint_chain() {
 	iptables -t $TABLE -A $PARENT_CHAIN ${=PARENT_SELECTOR} -j $CHAIN_1	# enable it in the parent chain
 }
 
-#
-# get_ports_of()
-#
-# Usage: get_ports_of {REGEX} {u|t}
-#
-# returns a comma-separated list of ports that a process matching REGEX
-# listens on (as displayed by netstat). u is for udp, t is for tcp.
-# REGEX is an extended regular expression.
-#
-function get_ports_of() {
-	echo \
-		$(netstat -n${2}lp \
-			| egrep -- "$1" \
-			| cut -d: -f2\
-			| sed 's/[[:space:]].*//' \
-		) \
-	| tr ' ' ','
-}
-
-# Get first IP of hostname
-function get_ip_of() {
-	tryto -t5 -k6 dnsip $1 | sed 's/[[:space:]].*//g' || {
-		echo "Failed to obtain IP of $1 via DNS." >&2
-	}
-}
-
-# Get main IP of interface
-function ip_of_if() {
-#	ifconfig $1 | grep 'inet addr:' | sed 's/.*inet addr://;s/ .*//'
-	if [[ -x /usr/bin/ifdata ]]; then
-		ifdata -pa $1 | grep -v NON-IP
-	else
-		ifconfig $1 | sed -n '2s/ [^r]*..//gp' # Credit: ice and Pista
-	fi
-}
-
-# Get broadcast address of interface
-function get_if_broadcast() {
-	if [[ -x /usr/bin/ifdata ]]; then
-		ifdata -pb $1 | grep -v NON-IP
-	else
-		ifconfig $1 | grep 'inet addr:' | sed 's/.*Bcast://;s/ .*//'
-	fi
-}
-
-# returns success if an interface exists, failure if it doesn't
-function if_exists() {
-	if [[ -x /usr/bin/ifdata ]]; then
-		ifdata -e $1
-	else
-		grep -q "^[[:space:]]*$1: " /proc/net/dev
-	fi
-}
-
-# returns success if an interface is 'up', failure if not
-function if_up() {
-	if_exists $1 || return 1
-	if [[ -x /usr/bin/ifdata ]]; then
-		ifdata -pf $1 | egrep -q '^On[[:space:]]+Up$'
-	else
-		ip link sh $1 | egrep -q "state UP "
-	fi
-}
-
-#
-# Don't actually call iptables; rather, build an iptables-restore compatible
-# text file.
-#
-function iptables() {
-	debug 5 Executing /sbin/iptables "$@"
-	if [[ "$1" == "-t" ]]; then
-		TABLE=$2
-		shift
-		shift
-	else
-		TABLE=filter
-	fi
-	if [[ "$1" == "-N" ]]; then
-		iptables-save -c -t $TABLE | grep "^:$2 " >>"$RESTOREDIR/${TABLE}.chains" || echo ":$2 - [0:0]" >>"$RESTOREDIR/${TABLE}.chains"
-		shift
-		shift
-	elif [[ "$1" == "-P" ]]; then
-		iptables-save -c -t $TABLE | grep "^:$2 $3 " >>"$RESTOREDIR/${TABLE}.policies" || echo ":$2 $3 [0:0]" >>"$RESTOREDIR/${TABLE}.policies"
-	else
-		echo "${(qqq)@}" | sed '
-				s/-p tcp/-p tcp -m tcp/
-				s/-p udp/-p udp -m udp/
-				s/NAT --to /NAT --to-destination /
-				s@/minute@/min@
-				s@/second@/sec@
-				s/"\([^ ]*\)"/\1/g
-			' >>"$RESTOREDIR/${TABLE}.rules"
-	fi
-}
-
-# Set up the work directory.
-function iptables_init() {
-	rm -rf "$RESTOREDIR"
-	mkdir -p "$RESTOREDIR"
-}
-
-# Load the rules we created.
-function iptables_commit() {
-	PWD="$(pwd)"
-	cd "$RESTOREDIR"
-	for table in filter nat mangle; do
-		touch ${table}.policies
-		if [[ (-e ${table}.chains) || (-e ${table}.policies) || (-e ${table}.rules) ]]; then
-			echo '*'"$table" >>commit
-			if [[ "$table" == "filter" ]]; then
-				builtin="INPUT OUTPUT FORWARD"
-			elif [[ "$table" == "nat" ]]; then
-				builtin="PREROUTING POSTROUTING OUTPUT"
-			elif [[ "$table" == "mangle" ]]; then
-				builtin="PREROUTING INPUT FORWARD OUTPUT POSTROUTING"
-			else
-				echo "Unknown table $table!"
-				return 1
-			fi
-			for chain in "${=builtin}"; do
-				grep ^:$chain ${table}.policies >>commit || iptables-save -c -t $table | grep "^:$chain " >>commit
-			done
-			[[ -e ${table}.chains ]] && cat ${table}.chains >>commit
-			[[ -e ${table}.rules ]] && cat ${table}.rules >>commit
-			echo COMMIT >>commit
-		fi
-	done
-	iptables-restore <commit
-	cd "$PWD"
-}
+zmodload zsh/datetime	# used by get_ip_of for caching
+zmodload zsh/stat	# used by get_ip_of for caching
+zmodload zsh/system	# used for file locking, e.g. in get_ip_of

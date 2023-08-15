@@ -1,0 +1,98 @@
+#!/bin/zsh
+#
+# This is a run script for a runit service. Its purpose is to extract IP addresses from logfiles and use them to build ipsets; either a whitelist of apparently-benign IP addresses or a blacklist of abusers.
+#
+# For example, clients that authenticate successfully via SSH might be whitelisted for other, less secure services, while attacking IPs might be blacklisted completely.
+#
+# One instance of this script maintains one ipset, but can watch multiple logs; so if you want to build whitelists and blacklists too, use two instances.
+#
+# In itself the script does nothing; you have to reference the ipset it maintains in your firewall rules.
+
+exec 2>&1
+SVNAME=$(basename $(pwd))
+if [[ -r config ]]; then
+	SVCONFIG=config
+else
+	SVCONFIG=/etc/default/$SVNAME
+fi
+
+ipset=legit-clients
+ipset_timeout=3600		# how many seconds ipset entries we create should be valid for
+ipset_type=hash:net
+ipset_hashsize=128
+ipset_maxelem=65536
+create_ipset=1			# set to 0 to inhibit creation of the ipset
+time_window=3600		# see below
+threshold=1			# need this many occurrences of an IP at most time_window seconds apart to take the listing action
+typeset -A thresholds		# we read strings of the form 'ipaddr some further words' from stdin. The 'some further words' can be used as keys in this hash and override the global threshold on an individual basis.
+typeset -A time_windows		# as above, but for time_window
+ip_regex='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[1-9][0-9]?)?$'	# if set, we try to validate IPs before passing them to ip_add_cmd
+rundir=/run/$SVNAME
+
+address_provider=(chpst -P get-ips-from-logs /etc/default/successful-auth)	# the command to run to get the IPs of apparently-legit clients, including command line arguments; the "API" is that the program shouldn't exit and keep printing the IPs of legit clients followed by optional arguments to "ipset add", one entry per line.
+ip_add_cmd=(ipset add)	# what to do with lines we read -- the command will be called with $legit_clients_set as the first argument and the entire line printed by $address_provider, split into words, as subsequent arguments.
+
+# example /etc/default/successful-auth file:
+############################################
+## this is a configfile for /var/lib/svn-checkout/misc-scripts/get-ips-from-logs
+#look_for=success
+#logfiles=(/var/log/sv/socklog/ssh/current /some/other/location/ssh/current /var/log/sv/courier-imap-ssl/current /var/log/sv/qmail-smtpd/current)
+#sedscript[/var/log/sv/qmail-smtpd/current]='
+#	/FILTER_WHITELIST_NAME/s/.*FILTER_WHITELIST_NAME ip: ([0-9.]+) .*/\1 timeout 300 comment smtp-client/p
+#	/spamdyke\[[0-9]+\]: ALLOWED from/s/.* origin_ip: ([0-9.]+) .*/\1 timeout 300 comment smtp-client/p
+#'
+#sedscript[/var/log/sv/socklog/ssh/current]='/Accepted/s/.* (password|publickey) for [^ ]+ from ([0-9.]+) port.*/\2 comment main-ssh-client/p'
+#sedscript[/some/other/location/ssh/current]='/Accepted/s/.* (password|publickey) for [^ ]+ from ([0-9.]+) port.*/\2 comment alternative-ssh-client/p'
+#sedscript[/var/log/sv/courier-imap-ssl/current]='/LOGIN,/s/.*, ip=\[([0-9.]+)\].*/\1 comment imap-client/p'
+############################################
+
+[[ -r $SVCONFIG ]] && . $SVCONFIG
+# backwards compatibility -- earlier versions of this script pretended it could only be used for whitelisting. hashsize and maxelem are not too important, so no backwards compatibility is provided:
+[[ -v legit_clients_set ]] && ipset=$legit_clients_set; [[ -v legit_clients_timeout ]] && ipset_timeout=$legit_clients_timeout; [[ -v legit_clients_set_type ]] && ipset_type=$legit_clients_set_type
+
+[[ -v ipset_create_options ]] || ipset_create_options=($ipset_type family inet hashsize $ipset_hashsize maxelem $ipset_maxelem counters forceadd timeout $ipset_timeout comment skbinfo)
+
+((create_ipset)) && { ipset save "$ipset" >/dev/null 2>/dev/null || ipset create -exist $ipset $ipset_create_options }
+
+if [[ $threshold -gt 1 ]]; then
+	zmodload zsh/datetime
+	if zmodload zsh/db/gdbm; then
+		install -d -m 700 $rundir
+	        while ! ztie -d db/gdbm -f $rundir/ip_count	ip_count; do
+			fuser -k $rundir/ip_count
+		done
+		while ! ztie -d db/gdbm -f $rundir/ip_lastseen	ip_lastseen; do
+			fuser -k $rundir/ip_lastseen
+		done
+	else    # fall back to plain hashes if gdbm is not available
+		typeset -A ip_count ip_lastseen
+	fi
+fi
+
+[[ -v ip_regex ]] || ip_regex=.
+
+# unset to release potentially ztied gdbm files in the subshell:
+( unset ip_count; unset ip_lastseen; exec $address_provider ) | while read -A ip; do
+	if [[ $ip[1] =~ $ip_regex ]]; then
+		[[ -v thresholds[$ip[2,$]] ]]	&& mythreshold=$thresholds[$ip[2,$]] 	|| mythreshold=$threshold
+		[[ -v time_windows[$ip[2,$]] ]]	&& mytimewindow=$time_windows[$ip[2,$]]	|| mytimewindow=$time_window
+		if [[ $mythreshold -gt 1 ]]; then
+			if [[ $ip_lastseen[$ip[1]] -ge $[EPOCHSECONDS-mytimewindow] ]]; then
+				((ip_count[$ip[1]]++))
+			else
+				[[ -n "$ip_count[$ip[1]]" ]] && echo "DEBUG: '$ip' seen $ip_count[$ip[1]] times, but last sighting was at $ip_lastseen[$ip[1]] ($(date --date @$ip_lastseen[$ip[1]])), more than $mytimewindow seconds ago. Resetting sighting count to 1." >&2
+				ip_count[$ip[1]]="1"	# maybe instead of setting to 1, just decrease it until it reaches 1? So that earlier misconduct is still kinda-sorta remembered?
+			fi
+			ip_lastseen[$ip[1]]=$EPOCHSECONDS
+			if [[ $ip_count[$ip[1]] -lt $threshold ]]; then
+				echo "DEBUG: '$ip' only seen $ip_count[$ip[1]] times (sightings at most $mytimewindow apart); not adding to ipset yet ($mythreshold sightings needed)." >&2
+				continue
+			fi
+		fi
+	else
+		echo "Warning: got '$ip' from '$address_provider' and the first word doesn't match '$ip_regex'. Ignoring." >&2
+		continue
+	fi
+	echo "DEBUG: running '$ip_add_cmd $ipset $ip'" >&2
+	eval $ip_add_cmd $ipset $ip
+done

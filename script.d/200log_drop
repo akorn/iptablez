@@ -1,0 +1,4 @@
+iptables -N log_drop	# and can be used anywhere a nondescriptive log message for dropped packets is sufficient
+iptables -A log_drop -j LOG	--log-prefix "FW: DROP: "	$LOGLIMIT						-m comment --comment "Generic log rule to log dropped packets with a rate limit"
+iptables -A log_drop $REJECT_BEFORE_DROP	# set in conf.d/reject to something like '(-j REJECT --reject-with admin-prohib $ICMP_OUT_LIMIT -m set --match-set private_nets src -m comment --comment "Internal clients get a helpful ICMP error, subject to rate limiting")'
+iptables -A log_drop -j DROP												-m comment --comment "In other cases, we just drop the packets with no ICMP"

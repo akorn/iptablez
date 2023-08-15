@@ -1,0 +1,10 @@
+antiportscan_legit_services_set=legit_service	# a hash:net,port,net ipset; contains clientrange,serverport,serverrange tuples; used by script.d/100antiportscan
+antiportscan_blacklist_target_tcp=(DROP)	# set to RETURN to just log
+antiportscan_blacklist_target_udp=(DROP)	# set to RETURN to just log
+antiportscan_blacklist_target_icmp=(DROP)	# set to RETURN to just log
+antiportscan_target_fallback=RETURN		# if DROP, antiporscan chains will drop non-blacklisted, non-legitservice traffic themselves. We don't want that; let antiportscan return instead.
+antiportscan_netmask=32				# this would only be effective as an ipset create option, but since we're probably using a pre-created 'blacklisted' set, we just make it explicit that the netmask is going to be /32, the netmask of that set
+antiportscan_blacklist_set=blacklisted_portscan	# we use a separate blacklist set for portscanners; the global blacklist ipset is a set of lists
+antiportscan_timeout=3600			# One hour
+antiportscan_exception_set=never_blacklist
+antiportscan_known_webserver_set=known_webservers

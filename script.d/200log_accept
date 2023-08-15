@@ -1,0 +1,3 @@
+iptables -N log_accept	# can be used anywhere a nondescriptive log message for acceptped packets is sufficient
+iptables -A log_accept -j LOG	--log-prefix "FW: ACCEPT: "	$LOGLIMIT						-m comment --comment "Generic log rule to log acceptped packets with a rate limit"
+iptables -A log_accept -j ACCEPT											-m comment --comment "Accept the packet now that we logged it"

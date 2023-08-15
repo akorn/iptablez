@@ -1,0 +1,58 @@
+#!/bin/zsh
+#
+# This is a run script for a runit service. Its purpose is to maintain a
+# whitelist of apparently-benign IP addresses based on log messages
+# pertaining to them. For example, clients that authenticate successfully
+# via SSH might be whitelisted for other, less secure services.
+#
+# In itself it does nothing; you have to reference the ipset it maintains in
+# your firewall rules.
+#
+# This is a simplified, special-case version of the build-ipset-from-log
+# script.
+#
+
+exec 2>&1
+SVNAME=$(basename $(pwd))
+if [[ -r config ]]; then
+	SVCONFIG=config
+else
+	SVCONFIG=/etc/default/$SVNAME
+fi
+
+legit_clients_set=legit-clients
+legit_clients_timeout=3600	# how many seconds whitelisting should be valid for
+legit_clients_set_type=hash:net
+legit_clients_set_hashsize=128
+legit_clients_set_maxelem=65536
+create_ipset=1			# set to 0 to inhibit creation of the ipset
+
+address_provider=(get-ips-from-logs /etc/default/successful-auth)	# the command to run to get the IPs of apparently-legit clients, including command line arguments; the "API" is that the program shouldn't exit and keep printing the IPs of legit clients followed by optional arguments to "ipset add", one entry per line.
+ip_add_cmd=(ipset add)	# what to do with lines we read -- the command will be called with $legit_clients_set as the first argument and the entire line printed by $address_provider, split into words, as subsequent arguments.
+
+# example /etc/default/successful-auth file:
+############################################
+## this is a configfile for /var/lib/svn-checkout/misc-scripts/get-ips-from-logs
+#look_for=success
+#logfiles=(/var/log/sv/socklog/ssh/current /some/other/location/ssh/current /var/log/sv/courier-imap-ssl/current /var/log/sv/qmail-smtpd/current)
+#sedscript[/var/log/sv/qmail-smtpd/current]='
+#	/FILTER_WHITELIST_NAME/s/.*FILTER_WHITELIST_NAME ip: ([0-9.]+) .*/\1 timeout 300 comment smtp-client/p
+#	/spamdyke\[[0-9]+\]: ALLOWED from/s/.* origin_ip: ([0-9.]+) .*/\1 timeout 300 comment smtp-client/p
+#'
+#sedscript[/var/log/sv/socklog/ssh/current]='/Accepted/s/.* (password|publickey) for [^ ]+ from ([0-9.]+) port.*/\2 comment main-ssh-client/p'
+#sedscript[/some/other/location/ssh/current]='/Accepted/s/.* (password|publickey) for [^ ]+ from ([0-9.]+) port.*/\2 comment alternative-ssh-client/p'
+#sedscript[/var/log/sv/courier-imap-ssl/current]='/LOGIN,/s/.*, ip=\[([0-9.]+)\].*/\1 comment imap-client/p'
+############################################
+
+[[ -r $SVCONFIG ]] && . $SVCONFIG
+
+legit_clients_set_create_options=($legit_clients_set_type family inet hashsize $legit_clients_set_hashsize maxelem $legit_clients_set_maxelem counters forceadd timeout $legit_clients_timeout comment skbinfo)
+
+exec 2>&1
+if ! ipset -S | grep -q "^create $legit_clients_set " && ((create_ipset)); then
+	ipset create $legit_clients_set $legit_clients_set_create_options
+fi
+
+$address_provider | while read -A ip; do
+	$ip_add_cmd $legit_clients_set $ip
+done

@@ -1,0 +1,6 @@
+# This set can be used e.g. to decide which IPs get helpful ICMP error messages (subject to a rate limit).
+create -exist private_nets hash:net family inet timeout 604800 counters forceadd comment skbinfo
+add -exist private_nets 10.0.0.0/8
+add -exist private_nets 192.168.0.0/16
+add -exist private_nets 172.16.0.0/12
+add -exist private_nets 169.254.0.0/16

@@ -40,15 +40,17 @@ avoiding any indeterminate state during initialisation.
 
 There are many helper functions for common tasks like granting access to a
 service to a set of source IPs or ranges, denying others, and logging
-refused attempts subject to a rate limit; or getting the IP of an interface
+refused attempts subject to a rate limit; or getting the IP of an interface;
 etc. You're encouraged to browse the functions file.
 
-Some example scriptlets are provided.
+Some example scriptlets are provided, for example to automatically block IPs
+that try to connect to {IP, port, protocol} tuples you know don't host a
+service.
 
 Usage
 =====
 
-Create /etc/iptablez/{conf,acl,script,post}.d directories.
+Create /etc/iptablez/{conf,acl,ipset,script,pre,post}.d directories.
 
 Symlink iptablez and functions into /etc/iptablez.
 
@@ -58,6 +60,25 @@ Create ACL files in acl.d (one entry per line; empty lines ignored; comments
 starting with # supported; recursive includes supported: ". file" includes
 "file"; shell variables will be expanded, so you can do "-s $MYSERVER").
 
+In conf.d files, you can look up names in DNS and assign the IPs to names in
+the following way:
+
+```
+get_ip_of some.hostname.here <default.ip> SHELL_VARIABLE
+```
+
+Example:
+
+```
+get_ip_of www.microsoft.com 2.17.245.133 WWW_MICROSOFT_COM
+```
+
+There is a disk-backed DNS cache with a configurable TTL; DNS lookups only
+actually happen if your firewall config references the `SHELL_VARIABLE`
+anywhere (so you can share conf.d snippets among hosts); and SHELL_VARIABLE
+is guaranteed to contain an IP, because the default IP is assigned to it if
+the lookup fails.
+
 Call /etc/iptablez/iptablez to build and load your ruleset.
 
 Dependencies
@@ -65,36 +86,31 @@ Dependencies
 
  * iptables (obviously).
 
- * zsh (obviously). Versions older than 4.0 may not work.
+ * zsh (obviously). Versions older than 5.0 may not work.
 
  * sed.
 
- * tryto(1) from the socklog package is used by some of the functions to
+ * `tryto(1)` from the socklog package is used by some of the functions to
    enforce timeouts.
 
- * dnsip(1) from the djbdns package is needed by some of the
-   functions.
+ * `dnsip(1)` from the djbdns package and `dig(1)` from the bind9-dnsutils
+   package is needed by some of the functions.
 
- * installing "moreutils" Debian package is recommended but not required
-   (the ifdata(8) tool is used if it's available).
+ * installing the `moreutils` Debian package is recommended but not
+   required (the `ifdata(8)` tool is used if it's available).
 
 Limitations
 ===========
 
-Adding rules that reference hostnames instead of IPs may not work
-(workaround: look up the IP beforehand; best put it in a shell variable from
-a file in conf.d).
-
 Adding rules that reference hostnames that resolve to more than one IP will
-almost certainly not work at all. Workaround: look up the IPs beforehand and
-add rules using a loop.
+almost certainly not work at all (although the `get_ip_of() function will at
+least return one of the IPs the name resolved to). Workaround: look up the
+IPs beforehand and add rules using a loop.
 
 TODO
 ====
 
  * Provide more and better examples, perhaps even a complete configuration.
-
- * Add explicit support for ipset(8).
 
  * Add ipv6 support (patches welcome).
 

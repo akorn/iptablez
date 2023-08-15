@@ -1,0 +1,6 @@
+# more specific rules are kept for their counters:
+-m conntrack --ctstate INVALID							-m comment --comment "Spurious TCP resets and such"
+-m set --match-set silentdrop_input_tcp dst -p tcp				-m comment --comment "Use an ipset instead of individual rules for by-port policy"
+-m set --match-set silentdrop_input_udp dst -p udp				-m comment --comment "Use an ipset instead of individual rules for by-port policy"
+-p udp --dport 1024:65535							-m comment --comment "Random UDP packets that are not explicitly allowed"
+		-d 255.255.255.255						-m comment --comment "Random broadcasts"

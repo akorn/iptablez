@@ -1,5 +1,27 @@
-iptables -N blacklisted
+if ! [[ -v LOG ]] || [[ -z "$LOG" ]]; then LOG=(-j LOG --log-prefix); fi
+if ! [[ -v BLACKLISTED_LOG_LIMIT ]] || [[ -z "$BLACKLISTED_LOG_LIMIT" ]]; then
+	if [[ -v LOGLIMIT ]]; then
+		if [[ ${$(typeset -p LOGLIMIT)[2]} = -a ]]; then
+			BLACKLISTED_LOG_LIMIT=($LOGLIMIT)
+		else
+			BLACKLISTED_LOG_LIMIT=(${=LOGLIMIT})
+		fi
+	else
+		BLACKLISTED_LOG_LIMIT=(-m hashlimit --hashlimit-upto 1/minute --hashlimit-burst 2 --hashlimit-mode srcip,dstport --hashlimit-srcmask 30 --hashlimit-name blacklisted_log_limit --hashlimit-htable-expire 600000)
+	fi
+fi
+# example:
+# REJECT_BEFORE_DROP=(-j REJECT --reject-with admin-prohib $ICMP_OUT_LIMIT -m set --match-set private_nets src -m comment --comment "Internal clients get a helpful ICMP error, subject to rate limiting")
+[[ -v BLACKLIST_TARPIT ]] || BLACKLIST_TARPIT=0
 
-iptables -A blacklisted ${=LOGLIMIT} -j LOG --log-prefix "FW: blacklisted DROP: "
-iptables -A blacklisted ${=ICMP_OUT_LIMIT} -j REJECT --reject-with admin-prohib
-iptables -A blacklisted -j DROP
+for chain in blacklisted blacklisted_output; do	# TARPIT is only valid for incoming and forwarded packets
+
+		iptables -N $chain
+		iptables -A $chain $LOG "FW: blacklisted DROP: "	$BLACKLISTED_LOG_LIMIT	-m comment --comment "Log packets to and from blacklisted IPs with a rate limit"
+	[[ -v REJECT_BEFORE_DROP ]]					&& \
+		iptables -A $chain $REJECT_BEFORE_DROP
+	((BLACKLIST_TARPIT)) && ! [[ $chain = blacklisted_output ]]	&& \
+		iptables -A $chain -j TARPIT -p tcp						-m comment --comment "tarpitting is even less friendly than dropping, but only works for TCP and for incoming connections"
+		iptables -A $chain -j DROP							-m comment --comment "In other cases, we just drop the packets with no ICMP"
+
+done

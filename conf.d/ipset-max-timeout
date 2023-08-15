@@ -1,0 +1,1 @@
+ipset_max_timeout=2147483	# This is the maximum timeout, in seconds, that ipset supports (just over 24 days).

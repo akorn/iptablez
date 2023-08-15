@@ -1,0 +1,1 @@
+set_logtarget	# sets $LOG to something reasonable, e.g. (-j LOG --log-prefix)

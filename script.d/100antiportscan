@@ -1,0 +1,125 @@
+# The idea is to have all clients that try to connect to more than "n" non-existing (non-declared) services should be blocked (e.g. tarpitted) on all subsequent connection attempts. This should confuse casual portscanners.
+
+# example:
+# ipset create antiportscan_legit_services hash:net,port,net timeout 0 counters forceadd comment skbinfo
+# ipset add antiportscan_legit_services 0.0.0.0/0,tcp:80,192.168.0.16/28 comment webservers
+# ipset add antiportscan_legit_services 0.0.0.0/0,tcp:443,192.168.0.16/28 comment webservers
+# ipset add antiportscan_legit_services 192.168.0.0/24,udp:514,192.168.0.254 comment "internal syslog clients"
+#
+# using it:
+# iptables -A INPUT [...] -j ACCEPT # stuff that shouldn't be subject to antiportscan, e.g. matching by incoming interface, or knocking
+# iptables -A INPUT -j antiportscan # returns if no antiportscan match
+# iptables -A INPUT [...] -j ACCEPT # for individual public services which shouldn't be visible to portscanners
+# similarly in FORWARD
+#
+# WARNING: if your attacker knows you're using something like this AND can spoof source addresses on his packets, he can make you lock out arbitrary IPs.
+#
+# There is a problem with http/3. Apparently webservers you contact can start sending you UDP traffic from port 443 (and maybe also 80), and you don't want to blacklist that webserver even if the UDP packet can't reach the client.
+# So in addition to antiportscan_exception_set, we support having an antiportscan_known_webserver_set, which can be maintained dynamically and from where we'll ignore incoming UDP from ports 443 and 80. This snippet will just use that set if it exists, not maintain it; maintenance (adding webservers) needs to happen in FORWARD and OUTPUT.
+
+antiportscan_max_portscan_attempts_before_blacklist=${antiportscan_max_portscan_attempts_before_blacklist:-1}	# number of non-UDP portscan attempts to permit before blacklisting clients. Set to 0 to blacklist immediately.
+antiportscan_max_portscan_attempts_before_blacklist_udp=${antiportscan_max_portscan_attempts_before_blacklist_udp:-5}	# number of UDP portscan attempts to permit before blacklisting clients. We're somewhat more lenient with UDP to allow for hole punching.
+antiportscan_timeout=${antiportscan_timeout:-7200}								# number of seconds to remember portscanners for
+antiportscan_netmask=${antiportscan_netmask:-28}								# numer of bits of address information to consider when tarpitting suspected portscanners. /28 should be a reasonable default.
+antiportscan_legit_services_set=${antiportscan_legit_services_set:-antiportscan_legit_services}			# should be a hash:net,port,net set; it will be matched used src,dst,dst (i.e. it should have clientrange,serverport,serverrange tuples).
+														# Specify client as 0.0.0.0/0 for public services with no client IP restrictions; or, better yet, use two rules, one with 0.0.0.0/1 and one with 128.0.0.0/1, because not all versions of the kernel and ipset support 0/0.
+antiportscan_blacklist_set=${antiportscan_blacklist_set:-antiportscan_blacklist}
+antiportscan_exception_set=${antiportscan_exception_set:-legit_clients}
+[[ -v antiportscan_blacklist_target_tcp ]] || antiportscan_blacklist_target_tcp=(DROP)				# could also be e.g. TARPIT or CHAOS; or RETURN to just log
+[[ -v antiportscan_blacklist_target_udp ]] || antiportscan_blacklist_target_udp=(DROP)				# could also be e.g. REJECT --reject-with icmp-admin-prohib
+[[ -v antiportscan_blacklist_target_icmp ]] || antiportscan_blacklist_target_icmp=(DROP)
+antiportscan_target_fallback=(${antiportscan_target_fallback:-DROP})						# what to do with packets from blacklisted clients if the protocol isn't handled explicitly
+antiportscan_blacklist_target_fallback=(${antiportscan_target_fallback:-RETURN})				# what to do if client is not blacklisted but it's trying to talk to a non-declared service
+antiportscan_main_chain=${antiportscan_main_chain:-antiportscan}
+antiportscan_udp_chain=${antiportscan_udp_chain:-antiportscan_udp}
+antiportscan_non_udp_chain=${antiportscan_non_udp_chain:-antiportscan_non_udp}
+antiportscan_do_blacklist_chain=${antiportscan_do_blacklist_chain:-antiportscan_do_blacklist}
+antiportscan_log_exception_chain=${antiportscan_log_exception_chain:-antiportscan_log_exception}
+[[ -v antiportscan_log_action ]] || antiportscan_log_action=(-j LOG --log-prefix)				# Could also be (-j NFLOG --nflog-prefix) to log via ulogd
+[[ -v antiportscan_loglimit ]] || antiportscan_loglimit=(${=LOGLIMIT})						# if $LOGLIMIT isn't set either, there'll be no rate limit on logging
+antiportscan_force_unpopulated=${antiportscan_force_unpopulated:-0}
+ipset save "$antiportscan_exception_set" >/dev/null 2>/dev/null || unset antiportscan_exception_set
+antiportscan_known_webserver_set=${antiportscan_known_webserver_set:-$antiportscan_exception_set}		# Default to the same set
+[[ -n $antiportscan_known_webserver_set ]] || unset antiportscan_known_webserver_set
+
+if ((antiportscan_force_unpopulated)) || ipset save "$antiportscan_legit_services_set" >/dev/null 2>/dev/null | grep -q '^add[[:space:]]'; then
+
+	ipset save "$antiportscan_blacklist_set" >/dev/null 2>/dev/null || ipset create -exist $antiportscan_blacklist_set \
+		hash:ip \
+		family inet \
+		netmask $antiportscan_netmask \
+		counters \
+		forceadd \
+		timeout $antiportscan_timeout \
+		comment \
+		skbinfo
+
+	# we must create the legit-services set too if it doesn't exist yet, because we reference it in our rules
+	ipset save "$antiportscan_legit_services_set" >/dev/null 2>/dev/null || ipset create -exist $antiportscan_legit_services_set \
+		hash:net,port,net \
+		timeout 0 \
+		counters \
+		forceadd \
+		comment \
+		skbinfo
+
+	# $antiportscan_log_exception_chain: log a message when a host would be filtered due to blacklisting but is not because it's in the exception set
+	iptables -N $antiportscan_log_exception_chain
+	iptables -A $antiportscan_log_exception_chain	$antiportscan_loglimit													$antiportscan_log_action "FW: antips: exception: "
+	iptables -A $antiportscan_log_exception_chain	-j RETURN
+
+	# $antiportscan_do_blacklist_chain: perform the actual logging/blocking action. Called from antiportscan_udp_chain and antiportscan_non_udp_chain. A separate chain to avoid having to duplicate these rules in the two callers.
+	iptables -N $antiportscan_do_blacklist_chain
+	iptables -A $antiportscan_do_blacklist_chain	-m set \! --match-set $antiportscan_blacklist_set src									-j RETURN							-m comment --comment "Client not on blacklist"
+	[[ -v antiportscan_exception_set ]] && ipset save "$antiportscan_exception_set" >/dev/null 2>/dev/null && \
+	  iptables -A $antiportscan_do_blacklist_chain	-m set --match-set $antiportscan_exception_set src									-g $antiportscan_log_exception_chain				-m comment --comment "These hosts should not be blocked due to portscanning, but activity logged."
+	[[ -v antiportscan_log_action ]] && \
+	  iptables -A $antiportscan_do_blacklist_chain $antiportscan_loglimit													$antiportscan_log_action "FW: antips: blacklisted: "
+	iptables -A $antiportscan_do_blacklist_chain	-p tcp															-j $antiportscan_blacklist_target_tcp				-m comment --comment "This client is already on the blacklist, so it can't reach real services."
+	iptables -A $antiportscan_do_blacklist_chain	-p udp															-j $antiportscan_blacklist_target_udp				-m comment --comment "This client is already on the blacklist, so it can't reach real services."
+	iptables -A $antiportscan_do_blacklist_chain	-p icmp															-j $antiportscan_blacklist_target_icmp				-m comment --comment "This client is already on the blacklist, so it can't reach real services."
+	[[ -v antiportscan_log_action ]] && \
+	  iptables -A $antiportscan_do_blacklist_chain $antiportscan_loglimit													$antiportscan_log_action "FW: antips: unhandled proto: "
+	iptables -A $antiportscan_do_blacklist_chain																-j $antiportscan_blacklist_target_fallback			-m comment --comment "Unhandled protocol; execute fallback action"
+
+	# a separate chain to see if possible portscanner already exceeded antiportscan_max_portscan_attempts_before_blacklist_udp attempts; if yes, we'll blacklist them via the antiportscan_do_blacklist_chain
+	iptables -N $antiportscan_udp_chain
+	iptables -A $antiportscan_udp_chain	-m set --match-set $antiportscan_blacklist_set src --packets-gt $antiportscan_max_portscan_attempts_before_blacklist_udp	-g $antiportscan_do_blacklist_chain				-m comment --comment "If already blacklisted, the client can't reach real services either"
+	iptables -A $antiportscan_udp_chain	-m set --match-set $antiportscan_legit_services_set src,dst,dst									-j RETURN							-m comment --comment "Attempts to access a declared service"
+	[[ -v antiportscan_known_webserver_set ]] && ipset save "$antiportscan_known_webserver_set" >/dev/null 2>/dev/null && \
+	  iptables -A $antiportscan_udp_chain	-m set --match-set $antiportscan_known_webserver_set src	-p udp	-m multiport --source-ports 80,443			-j RETURN							-m comment --comment "These are known webservers; maybe they're trying http/3 and that's why they're sending UDP."
+	[[ -v antiportscan_log_action ]] && \
+	  iptables -A $antiportscan_udp_chain $antiportscan_loglimit														$antiportscan_log_action "FW: antips: unlisted srv: "
+	iptables -A $antiportscan_udp_chain	-j SET --add-set $antiportscan_blacklist_set src --exist --timeout $antiportscan_timeout													-m comment --comment "Not a declared service; adding to blacklist"
+	iptables -A $antiportscan_udp_chain	-m set --match-set $antiportscan_blacklist_set src --packets-gt $antiportscan_max_portscan_attempts_before_blacklist_udp	-g $antiportscan_do_blacklist_chain				-m comment --comment "Check to see if we must already take some blacklist action"
+	iptables -A $antiportscan_udp_chain 																	-j $antiportscan_target_fallback 				-m comment --comment "Fallback action if client is not blacklisted BUT it's trying to talk to a non-declared service"
+
+	# a separate chain to see if possible portscanner already exceeded antiportscan_max_portscan_attempts_before_blacklist attempts; if yes, we'll blacklist them via the antiportscan_do_blacklist_chain
+	iptables -N $antiportscan_non_udp_chain
+	iptables -A $antiportscan_non_udp_chain	-m set --match-set $antiportscan_blacklist_set src --packets-gt $antiportscan_max_portscan_attempts_before_blacklist		-g $antiportscan_do_blacklist_chain				-m comment --comment "If already blacklisted, the client can't reach real services either"
+ 	iptables -A $antiportscan_non_udp_chain -p tcp \! --syn															-j RETURN							-m comment --comment "Not a SYN packet; could be a stray or delayed ack. Not grounds for blocking"
+# 	iptables -A $antiportscan_non_udp_chain -p tcp --tcp-flags ACK SYN,ACK,FIN,RST												-j RETURN							-m comment --comment "Stray, perhaps delayed ACK; should not lead to blocking"
+# 	iptables -A $antiportscan_non_udp_chain -p tcp --tcp-flags FIN SYN,ACK,FIN,RST												-j RETURN							-m comment --comment "Stray, perhaps delayed FIN; should not lead to blocking"
+# 	iptables -A $antiportscan_non_udp_chain -p tcp --tcp-flags ACK,FIN SYN,ACK,FIN,RST											-j RETURN							-m comment --comment "Stray, perhaps delayed FINACK; should not lead to blocking"
+	iptables -A $antiportscan_non_udp_chain	-m set --match-set $antiportscan_legit_services_set src,dst,dst									-j RETURN							-m comment --comment "Attempts to access a declared service"
+	iptables -A $antiportscan_non_udp_chain	-p tcp -m conntrack \! --ctstate NEW												-j RETURN							-m comment --comment "TCP packet, but not a new connection -- could be related to a session we don't track anymore, but not grounds for filtering"
+	[[ -v antiportscan_log_action ]] && \
+	  iptables -A $antiportscan_non_udp_chain $antiportscan_loglimit													$antiportscan_log_action "FW: antips: unlisted srv: "
+	iptables -A $antiportscan_non_udp_chain	-j SET --add-set $antiportscan_blacklist_set src --exist --timeout $antiportscan_timeout													-m comment --comment "Not a declared service; adding to blacklist"
+	iptables -A $antiportscan_non_udp_chain	-m set --match-set $antiportscan_blacklist_set src --packets-gt $antiportscan_max_portscan_attempts_before_blacklist		-g $antiportscan_do_blacklist_chain				-m comment --comment "Check to see if we must already take some blacklist action"
+	iptables -A $antiportscan_non_udp_chain 																-j $antiportscan_target_fallback 				-m comment --comment "Fallback action if client is not blacklisted BUT it's trying to talk to a non-declared service"
+
+	iptables -N $antiportscan_main_chain
+	iptables -A $antiportscan_main_chain	-m conntrack --ctstate ESTABLISHED,RELATED,INVALID,UNTRACKED									-j RETURN 							-m comment --comment "Existing, invalid and untracked connections are not appropriate for antiportscan treatment"
+	iptables -A $antiportscan_main_chain	-p udp																-g $antiportscan_udp_chain 					-m comment --comment "Branch to separate UDP chain to make rules easier to follow"
+	iptables -A $antiportscan_main_chain \! -p udp																-g $antiportscan_non_udp_chain 					-m comment --comment "Branch to separate non-UDP chain to make rules easier to follow"
+	iptables -A $antiportscan_main_chain	-m set --match-set $antiportscan_legit_services_set src,dst,dst									-j RETURN							-m comment --comment "Attempts to access a declared service AND is not blacklisted"
+	iptables -A $antiportscan_main_chain 																	-j $antiportscan_target_fallback 				-m comment --comment "Fallback action if client is not blacklisted BUT it's trying to talk to a non-declared service"
+	iptables -A $antiportscan_main_chain 																	-j RETURN		 					-m comment --comment "Filtering occurs in two subchains above"
+
+else
+
+	# if the set exists but is empty, the rules could still be loaded and allow you to perhaps shoot yourself in the foot; make that harder
+	echo "antiportscan logic requires the $antiportscan_legit_services_set ipset to exist and be populated; otherwise it will blacklist all clients. Not enabling. Override by setting antiportscan_force_unpopulated=1 in config." >&2
+
+fi

@@ -1,0 +1,65 @@
+# == Install dependencies ==
+# 
+# `apt install xtables-addons-dkms libnet-cidr-lite-perl libtext-csv-xs-perl`
+# 
+# == Initial setup ==
+#
+# For a completely local setup:
+#
+# {{{
+# mkdir -p /usr/local/share/xt_geoip
+# ln -s /usr/local/share/xt_geoip /usr/share
+# cd /usr/local/share/xt_geoip
+# /usr/libexec/xtables-addons/xt_geoip_dl
+# /usr/libexec/xtables-addons/xt_geoip_build
+# }}}
+# 
+# The last three commands should be run regularly, e.g. from cron.
+#
+# If relying on this repository:
+#
+# {{{
+# ln -s /path/to/svn/working/copy/xt_geoip /usr/share
+# }}}
+# 
+# == Firewall rules ==
+# 
+# Examples:
+# 
+#  * `iptables -A INPUT -m geoip --src-cc ru -j DROP` to drop all packets from Russia.
+#  * `iptables -A INPUT -m geoip --src-cc ru,cn -j DROP` to drop all packets from Russia and China.
+#  * `iptables -A FORWARD -m geoip --dst-cc by -j DROP` to drop all forwarded packets to Belarus.
+#
+# == Configuration example ==
+#
+# country_blacklist=(aq ax sj sh hm)
+# typeset -A countrynames
+# countrynames[aq]=Antarctica
+# countrynames[ax]=Åland
+# countrynames[sj]="Svalbard and Jan Mayen Islands"
+# countrynames[sh]="Saint Helena"
+# countrynames[hm]="Heard and MC Donald Islands"
+#
+# country_blacklist_dns=(sh hm)	# don't even allow DNS replies from these countries (which must also be in country_blacklist for this setting to be effective)
+[[ -v country_blacklist_dns ]] || country_blacklist_dns=()
+
+[[ -z "$LOG" ]] && LOG=(-j LOG --log-prefix)
+[[ -z "$LOGLIMIT" ]] && LOGLIMIT=(-m limit --limit 5/minute)
+
+for c in $country_blacklist; do
+	for dir in from to; do
+		iptables -N country_${dir}_$c
+		if [[ $country_blacklist_dns[(I)$c] = 0 ]]; then
+			if [[ $dir == from ]]; then
+				iptables -A country_${dir}_$c -j ACCEPT -p udp --sport 53 -m state --state ESTABLISHED		-m comment --comment "Accept DNS replies even from blacklisted country $countrynames[$c]"
+				iptables -A country_${dir}_$c -j ACCEPT -p tcp --sport 53 -m state --state ESTABLISHED		-m comment --comment "Accept DNS replies even from blacklisted country $countrynames[$c]"
+			else
+				iptables -A country_${dir}_$c -j ACCEPT -p udp --dport 53 -m state --state NEW,ESTABLISHED	-m comment --comment "Accept DNS queries even to blacklisted country $countrynames[$c]"
+				iptables -A country_${dir}_$c -j ACCEPT -p tcp --dport 53 -m state --state NEW,ESTABLISHED	-m comment --comment "Accept DNS queries even to blacklisted country $countrynames[$c]"
+			fi
+		fi
+		iptables -A country_${dir}_$c $LOGLIMIT $LOG "FW: $dir $countrynames[$c]: "
+		[[ $dir == from ]] && iptables -A country_${dir}_$c -j TARPIT -p tcp						-m comment --comment "tarpitting is even less friendly than dropping, but only works for TCP and for incoming connections"
+		iptables -A country_${dir}_$c -j DROP
+	done
+done

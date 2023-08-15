@@ -1,0 +1,15 @@
+iptables -N icmp_forward	# can be referenced in e.g. filter/FORWARD
+iptables -N icmp_forward_limit	# referenced in icmp_forward
+
+iptables -A icmp_forward_limit -j ACCEPT $ICMP_FORWARD_LIMIT
+iptables -A icmp_forward_limit $LOGLIMIT $LOG ${LOG:+"FW: ICMP ratelimit: "}
+iptables -A icmp_forward_limit -j DROP
+
+readacl $ACLDIR/usefulicmp \
+	| while read -A i; do
+		iptables -A icmp_forward -j icmp_forward_limit -p icmp --icmp-type $i
+	done
+
+iptables -A icmp_forward $LOGLIMIT $LOG ${LOG:+"FW: offensive ICMP: "}
+iptables -A icmp_forward -j DROP
+

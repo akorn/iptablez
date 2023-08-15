@@ -1,0 +1,1 @@
+REJECT_BEFORE_DROP=(-j REJECT --reject-with admin-prohib $ICMP_OUT_LIMIT -m set --match-set private_nets src -m comment --comment "Internal clients get a helpful ICMP error, subject to rate limiting")

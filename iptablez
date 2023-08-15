@@ -1,6 +1,6 @@
 #!/bin/zsh
 #
-# iptablez  Copyright (C) 2000-2013  Dr. András Korn
+# iptablez  Copyright (C) 2000-2023  Dr. András Korn
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -21,73 +21,95 @@
 # debuglevel is an integer; useful values range from 0 to 5. The default is
 # currently 1.
 
-BASEDIR=/etc/iptablez
-
-CONFFILES=($BASEDIR/iptablez.conf /etc/default/iptablez)
-
-for conf in $CONFFILES[@]; do
-	[[ -r "$conf" ]] && . $conf
+for i in /etc/iptablez /etc/firewall; do
+	if [[ -d $i ]]; then
+		BASEDIR=$i
+		break
+	fi
 done
+
+DEFAULTS=$BASEDIR/firewall-defaults
+
+[[ -r "$DEFAULTS" ]] && . $DEFAULTS
 
 CONFDIR=${CONFDIR:-$BASEDIR/conf.d}
 SCRIPTDIR=${SCRIPTDIR:-$BASEDIR/script.d}
+PREDIR=${PREDIR:-$BASEDIR/pre.d}
 POSTDIR=${POSTDIR:-$BASEDIR/post.d}
 ACLDIR=${ACLDIR:-$BASEDIR/acl.d}
-RESTOREDIR=$BASEDIR/iptables-restore	# Will be removed and re-created; don't put anything in here!
+IPSET_CONF_D=${IPSET_CONF_D:-$BASEDIR/ipset.d}
+IPSET_CONF=${IPSET_CONF:-$BASEDIR/ipset.conf}
+RESTOREDIR=$BASEDIR/restore
 [[ "$1" = "" ]] || DEBUG=$1
 DEBUG=${DEBUG:-1}
+TRANSITIONAL_POLICY=${TRANSITIONAL_POLICY:-ACCEPT}	# what to set policies to while the firewall is being initialized
+UNLOAD_MODULES=${UNLOAD_MODULES:-0}
 
 function debug() {
 	if [[ "$DEBUG" -ge "$1" ]]; then
 		shift
-		echo "$@"
+		echo "$@" >&2
 	fi
 }
 
+# We can't assume no sourced script will read from stdin, so we assemble a list of files to source before sourcing first one, using the functions below:
+
+# args: dir1 [ dir2 ... ]; outputs a list of includable files/symlinks in directories, depth first, one per line
+function find_includable() {
+	local depth i dir
+	for dir in $@; do
+		[[ -d "$dir" ]] && for depth in {10..1}; do
+			find -L "$dir/" -mindepth $depth -maxdepth $depth ! -type d \
+			| grep -v -F /.svn/ \
+			| sort \
+			| while read -r i; do
+				echo -E "$i"
+			done
+		done
+	done
+}
+
+# args: array of files to source one after the other
+function source_files() {
+	# Sourced files may contain loops with "i" as the loop variable, so use something less likely to occur there
+	local script_i
+	for script_i in ${(P)1}; do
+		if [[ -r "$script_i" ]]; then
+			debug 2 "Sourcing '$script_i'..."
+			. "$script_i"
+			if [[ $? = 126 ]]; then
+				echo "FATAL: '$script_i' returned 126; maybe it referenced an uninitialized variable. Aborting." >&2
+				exit 126
+			fi
+		else
+			debug 1 "WARNING: '$script_i' is unreadable."
+		fi
+	done
+}
+
+# args: dir1 [ dir2 ... ]. First builds an array of includable files, then includes them in sequence and prints an error if necessary.
+function include_from() {
+	local OLDIFS="$IFS"
+	local IFS="
+"
+	local filelist=($(find_includable $@))
+	IFS="$OLDIFS"
+	source_files filelist
+}
+
+include_from "$PREDIR"
+
+# we do this now instead of at the start so that files from PREDIR can override BASEDIR
 debug 2 Sourcing functions...
 . "$BASEDIR/functions"
 
 iptables_init
 
-# Can't assume no sourced script will read from stdin, so assmble list of
-# files to source before sourcing first one:
-for dir in "$CONFDIR" "$SCRIPTDIR"; do
-	for depth in {10..1}; do
-		find "$dir" -mindepth $depth -maxdepth $depth ! -type d \
-		| fgrep -v /.svn/ \
-		| sort \
-		| while read i; do
-			FILES=($FILES $i)
-		done
-	done
-done
-
-# Sourced files likely contain loops with "i" as the loop variable...
-for script_i in $FILES[@]; do
-	if [[ -r "$script_i" ]]; then
-		debug 2 Sourcing "$script_i"...
-		. "$script_i"
-	else
-		debug 1 WARNING: "$script_i" is unreadable.
-	fi
-done
+include_from "$CONFDIR" "$SCRIPTDIR"
 
 iptables_commit
+iptables_ret=$?
 
-[[ -d "$POSTDIR" ]] && for depth in {10..1}; do
-	find "$POSTDIR" -mindepth $depth -maxdepth $depth ! -type d \
-	| fgrep -v /.svn/ \
-	| sort \
-	| while read i; do
-			POSTFILES=($POSTFILES $i)
-	done
-done
+include_from "$POSTDIR"
 
-for script_i in $POSTFILES[@]; do
-	if [[ -r "$script_i" ]]; then
-		debug 2 Sourcing "$script_i"...
-		. "$script_i"
-	else
-		debug 1 WARNING: "$script_i" is unreadable.
-	fi
-done
+exit $iptables_ret

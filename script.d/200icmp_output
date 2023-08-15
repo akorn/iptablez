@@ -1,0 +1,17 @@
+iptables -N icmp_output
+iptables -N icmp_output_limit
+
+[[ -v icmp_input_unlimited_interfaces ]] && for iface in $icmp_output_unlimited_interfaces[@]; do	# would using an ACL be better?
+	iptables -A icmp_output -o $iface -j ACCEPT
+done
+
+iptables -A icmp_output_limit -j ACCEPT $ICMP_OUT_LIMIT
+iptables -A icmp_output_limit $LOGLIMIT $LOG ${LOG:+"FW: ICMP ratelimit: "}
+iptables -A icmp_output_limit -j DROP
+
+readacl $ACLDIR/usefulicmp | while read i; do
+	iptables -A icmp_output -j icmp_output_limit	-p icmp --icmp-type	$i
+done
+
+iptables -A icmp_output $LOG ${LOG:+"FW: offensive ICMP: "}	$LOGLIMIT
+iptables -A icmp_output -j DROP

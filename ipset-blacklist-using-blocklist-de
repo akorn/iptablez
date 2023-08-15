@@ -1,0 +1,18 @@
+#!/bin/zsh
+#
+# Downloads list of shady IPs from blocklist.de and adds them to an ipset
+#
+
+blocklist_de_url=https://lists.blocklist.de/lists/all.txt
+blocklist_de_ipset=blacklisted	# will not be created
+blocklist_de_timeout=4000	# assuming cron.hourly updates
+[[ -r /etc/firewall/conf.d/blocklist-de ]] && . /etc/firewall/conf.d/blocklist-de
+
+curl -s $blocklist_de_url \
+	| egrep '^[0-9.]+$' \
+	| iprange --optimize \
+	| sed "
+		s/^/add -exist $blocklist_de_ipset /
+		s/\$/ timeout $blocklist_de_timeout comment blocklist.de/
+	" \
+	| ipset restore
