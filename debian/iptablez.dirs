@@ -1,0 +1,10 @@
+etc/iptablez
+etc/iptablez/conf.d
+etc/iptablez/acl.d
+etc/iptablez/ipset.d
+etc/iptablez/script.d
+etc/iptablez/pre.d
+etc/iptablez/post.d
+var/lib/iptablez
+var/lib/iptablez/dnscache
+var/lib/iptablez/restore

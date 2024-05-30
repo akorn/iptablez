@@ -3,7 +3,7 @@
 # This script will update the files in this directory.
 
 typeset -U missing_packages
-for i in libtext-csv-xs-perl libnet-cidr-lite-perl; do
+for i in libtext-csv-xs-perl libnet-cidr-lite-perl xtables-addons-dkms; do
 	if ! dpkg -s $i >/dev/null 2>/dev/null; then
 		missing_packages=($missing_packages $i)
 	fi
