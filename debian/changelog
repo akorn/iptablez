@@ -1,3 +1,10 @@
+iptablez (0.1.1) unstable; urgency=medium
+
+  * Fix restore symlink.
+  * Add some local changes.
+
+ -- Lorinc Szaray <opensource-github@carpoon.hu>  Mon, 24 Jan 2025 16:15:00 +0200
+
 iptablez (0.1.0) unstable; urgency=medium
 
   * Initial release of the package.
