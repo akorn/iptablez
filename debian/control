@@ -1,7 +1,7 @@
 Source: iptablez
 Section: admin
 Priority: optional
-Maintainer: András Korn <korn-iptablez@elan.rulez.org>
+Maintainer: Unofficial Build <please-set-a-maintainer@example.com>
 Standards-Version: 4.0.0
 Build-Depends: debhelper (>= 9), quilt
 
@@ -9,7 +9,7 @@ Package: iptablez
 Architecture: all
 Multi-Arch: foreign
 Depends: zsh, iptables, ipset, dbndns, bind9-dnsutils, tryto | socklog, ${misc:Depends}
-Recommends: xtables-addons-dkms, libtext-csv-xs-perl, libnet-cidr-lite-perl, xtables-addons-dkms, moreutils
+Recommends: xtables-addons-dkms, libtext-csv-xs-perl, libnet-cidr-lite-perl, xtables-addons-common, moreutils
 Description: A collection of scripts to maintain iptables rules
  A collection of zsh functions and scriptlets to help build maintainable iptables rulesets.
  Using these zsh scripts, the firewall setup can be split into several small files: you can have files that define access control lists, files that set up configuration variables (such as symbolic names for IP addresses), and files that set up the effective rules (e.g. one chain per file, or whatever makes sense).
