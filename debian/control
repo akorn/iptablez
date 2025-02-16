@@ -1,0 +1,18 @@
+Source: iptablez
+Section: admin
+Priority: optional
+Maintainer: Unofficial Build <please-set-a-maintainer@example.com>
+Standards-Version: 4.0.0
+Build-Depends: debhelper (>= 9), quilt
+
+Package: iptablez
+Architecture: all
+Multi-Arch: foreign
+Depends: zsh, iptables, ipset, dbndns, bind9-dnsutils, tryto | socklog, ${misc:Depends}
+Recommends: xtables-addons-dkms, libtext-csv-xs-perl, libnet-cidr-lite-perl, xtables-addons-common, moreutils
+Description: A collection of scripts to maintain iptables rules
+ A collection of zsh functions and scriptlets to help build maintainable iptables rulesets.
+ Using these zsh scripts, the firewall setup can be split into several small files: you can have files that define access control lists, files that set up configuration variables (such as symbolic names for IP addresses), and files that set up the effective rules (e.g. one chain per file, or whatever makes sense).
+ You can use (almost) the full power of the iptables command line, but instead of invoking iptables(8) directly, the script wraps it in a shell function; it builds a rule file loadable atomically by iptables-restore, avoiding any indeterminate state during initialisation.
+ There are many helper functions for common tasks like granting access to a service to a set of source IPs or ranges, denying others, and logging refused attempts subject to a rate limit; or getting the IP of an interface; etc. You're encouraged to browse the functions file.
+ Some example scriptlets are provided, for example to automatically block IPs that try to connect to {IP, port, protocol} tuples you know don't host a service.

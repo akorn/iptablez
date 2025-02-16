@@ -1,8 +1,8 @@
-iptables-save >/etc/firewall/restore/saved
+iptables-save >/etc/iptablez/restore/saved
 ipset save | sed -r '/^create.*hash:/{
         s/$/ counters forceadd comment skbinfo/
         s/ counters (.*)counters/ counters \1/g
         s/ forceadd (.*)forceadd/ forceadd \1/g
         s/ comment (.*)comment/ comment \1/g
         s/ skbinfo (.*)skbinfo/ skbinfo \1/g
-        }' >/etc/firewall/restore/ipset
+        }' >/etc/iptablez/restore/ipset

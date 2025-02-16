@@ -1,0 +1,11 @@
+--- a/iptablez
++++ b/iptablez
+@@ -101,7 +101,7 @@
+ 
+ # we do this now instead of at the start so that files from PREDIR can override BASEDIR
+ debug 2 Sourcing functions...
+-. "$BASEDIR/functions"
++. "/usr/share/iptablez/functions"
+ 
+ iptables_init
+ 

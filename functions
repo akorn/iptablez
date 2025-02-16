@@ -1,7 +1,7 @@
 #
 # functions to ease the construction of iptables firewalls
 #
-# iptablez  Copyright (C) 2000-2023  Dr. András Korn
+# iptablez  Copyright (C) 2000-2025  Dr. András Korn
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -27,7 +27,8 @@
 function readacl() {
 	local i=""
 
-	[[ -r "$1" ]] && egrep -v '^[[:space:]#]*$|^#' "$1" \
+	if [[ -r "$1" ]]; then
+		egrep -v '^[[:space:]#]*$|^#' "$1" \
 		| sed 's/[[:space:]]*#.*//' \
 		| while read -r i; do
 			if [[ "$i" == "${i#. }" ]]; then
@@ -38,6 +39,9 @@ function readacl() {
 		done \
 		| egrep -v '^[[:space:]#]*$|^#' \
 		| sed 's/[[:space:]]*#.*//'
+		return $?
+	fi
+	return 0
 }
 
 # TODO: wrap ipset(8) the same way we wrap iptables(8) and generate a file
@@ -45,7 +49,7 @@ function readacl() {
 # didn't create still exist, and/or if ipset elements we didn't create exist.
 #
 # reads 'ipset' commands from $IPSET_CONF_D and $IPSET_CONF
-# (/etc/firewall/ipset.d/* and etc/firewall/ipset.conf by default) and
+# (/etc/iptablez/ipset.d/* and /etc/iptablez/ipset.conf by default) and
 # executes them; supports shell variables and includes (since it uses
 # readacl()).  ipset comments should appear at the end of the ipset command
 # line.
@@ -88,7 +92,7 @@ function process_ipset_lines() {
 # helper function used by restore-ipsets(); prints all ipset lines from ipset.d/* and ipset.conf. TODO: support an entire hierarchy of ipset.d/ directories (not hard, but I don't currently need it)
 function produce_ipset_lines() {
 	local i
-	for i in ${IPSET_CONF_D:-/etc/firewall/ipset.d}/*(N) ${IPSET_CONF:-/etc/firewall/ipset.conf}; do
+	for i in ${IPSET_CONF_D:-/etc/iptablez/ipset.d}/*(N) ${IPSET_CONF:-/etc/iptablez/ipset.conf}; do
 		readacl $i
 	done
 }
@@ -133,7 +137,7 @@ function get_ports_of() {
 # If no IP can be obtained, the function returns "N/A".
 #
 # Note on caching: using two gdbm files (one for results, one for expiry times of results) is tempting, but it wouldn't support multithreading. With the current approach, a background process can keep the cache fresh for future firewall reloads and concurrency is not a problem.
-DNS_CACHEDIR=/var/lib/firewall/dnscache
+DNS_CACHEDIR=/var/lib/iptablez/dnscache
 DNS_NOCACHE=0
 DNS_FORCE_CACHE=0
 DNS_TIMEOUT=5
@@ -143,7 +147,7 @@ DNS_MIN_TTL=10
 DNS_MAX_TTL=$[86400+3600]	# one day plus one hour
 DNS_FORCE_LOOKUP=0
 function get_ip_of() {
-	local dnscachedir=${DNS_CACHEDIR:-/var/lib/firewall/dnscache}
+	local dnscachedir=${DNS_CACHEDIR:-/var/lib/iptablez/dnscache}
 	local cached_result
 	local name ttl type lookup_result crap
 	local lockfd
@@ -228,6 +232,34 @@ function get_ip_of() {
 	return 1
 }
 
+# Like get_ip_of, but only uses hosts file
+function get_ip_from_hosts_file() {
+	local name=$1
+	local fallback=$2
+	local varname=$3
+	local lookup_result crap ret
+	getent hosts -s files $name | read lookup_result crap
+	if [[ $lookup_result =~ ^[0-9.]+$ ]]; then
+		ret=0
+	else
+		if [[ -n $fallback ]]; then
+			echo "Failed to obtain IP of $name via hosts file. Defaulting to $fallback." >&2
+			lookup_result="$fallback"
+			ret=0
+		else
+			echo "Failed to obtain IP of $name via hosts file. No fallback IP provided; returning 'N/A' which will probably cause problems." >&2
+			lookup_result=N/A
+			ret=1
+		fi
+	fi
+	if [[ -n "$varname" ]]; then
+		typeset -g $varname="$lookup_result"
+	else
+		echo -E "$lookup_result"
+	fi
+	return $ret
+}
+
 # Returns first non-loopback IP address of lxc guest $1, or the first IP of guest interface $3 (if specified), defaulting to $2 (if specified); if no default is given and unable to obtain IP, return an error and the string "n/a"
 function get_lxc_guest_ip() {
 	local may_attach=${may_attach:-1}	# If may_attach=0, we won't try attaching to the container. This may be necessary if attaching to it might block.
@@ -270,7 +302,7 @@ function get_lxc_guest_ip() {
 	if [[ -v iface ]]; then
 		local ifnum=$(sed -n 's/^lxc\.net\.\([0-9]\+\)\.name[[:space:]]*=[[:space:]]*'$iface'/\1/p' /var/lib/lxc/$guest/config)
 		if [[ $ifnum =~ ^[0-9]+$ ]]; then
-			ip=$(sed -n 's/^lxc\.net\.'$ifnum'.ipv4\.address[[:space:]]*=[[:space:]]*\([0-9.]\+\)/\1/p' /var/lib/lxc/$guest/config)
+			ip=$(sed -rn 's/^lxc\.net\.'$ifnum'.ipv4\.address[[:space:]]*=[[:space:]]*([0-9.]+)(\/[0-9]*)?[[:space:]]*$/\1/p' /var/lib/lxc/$guest/config)
 			if [[ $ip =~ ^[0-9.]+$ ]] then
 				echo $ip
 				return 0
@@ -278,7 +310,7 @@ function get_lxc_guest_ip() {
 		fi # here we could add an elif and try to parse it out of the /etc/network/interfaces file of the guest, but that really seems too much (it's not even necessarily a Debian-like guest)
 	else
 		# no iface specified; try to get *any* ipv4 address from lxc config
-		ip=$(sed -n 's/^lxc\.net\.[0-9]\+.ipv4\.address[[:space:]]*=[[:space:]]*\([0-9.]\+\)/\1/p' /var/lib/lxc/$guest/config | grep -v '^127\.' | head -n 1)
+		ip=$(sed -rn 's/^lxc\.net\.[0-9]+.ipv4\.address[[:space:]]*=[[:space:]]*([0-9.]+)(\/[0-9]*)?[[:space:]]*$/\1/p' /var/lib/lxc/$guest/config | grep -v '^127\.' | head -n 1)
 		if [[ $ip =~ ^[0-9.]+$ ]] then
 			echo $ip
 			return 0
@@ -301,7 +333,7 @@ function ip_of_if() {
 	else
 		ifconfig $1 | sed -n '2s/ [^r]*..//gp'
 	fi)
-	echo ${addr:-$2}
+	echo ${addr:-${2:-""}}
 }
 
 # Get broadcast address of interface
@@ -455,8 +487,8 @@ function has_ip() {
 # the ACLFILE.
 #
 # example: buildchain filter ssh INPUT "-p tcp --dport ssh" "-s" \
-#	/etc/firewall/acls/ssh_allow ACCEPT REJECT "FW: ssh REJECT: "
-#	/etc/firewall/acls/sshprobes 
+#	/etc/iptablez/acls/ssh_allow ACCEPT REJECT "FW: ssh REJECT: "
+#	/etc/iptablez/acls/sshprobes
 #
 # Will use LOGLIMIT, if set. If called with only one parameter, assumes it
 # is a config file and will source it.
@@ -508,7 +540,7 @@ function buildchain() {
 function buildtcpchain() {
 	local PORT="$1"
 	local MYREJECT="${REJECT:-REJECT -p tcp --reject-with tcp-reset}"
-	local MYACLDIR="${ACLDIR:-/etc/firewall/acl.d}"
+	local MYACLDIR="${ACLDIR:-/etc/iptablez/acl.d}"
 	local CHAIN="${PORT}_input"
 	local ACL="$MYACLDIR/${PORT}"
 	local FRIENDLYNAME="${PORT}"
@@ -562,7 +594,7 @@ function buildtcpchain() {
 function buildudpchain() {
 	local PORT="$1"
 	local MYREJECT="${REJECT:-REJECT --reject-with tcp-reset}"
-	local MYACLDIR="${ACLDIR:-/etc/firewall/acl.d}"
+	local MYACLDIR="${ACLDIR:-/etc/iptablez/acl.d}"
 	local CHAIN="${PORT}_input"
 	local ACL="$MYACLDIR/${PORT}"
 	local FRIENDLYNAME="${PORT}"
